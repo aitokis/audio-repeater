@@ -231,7 +231,7 @@ bool Transport::push(std::span<const float> input) noexcept {
 std::size_t Transport::render(std::span<float> output) noexcept {
     if (output.size() % channels_ || output.size() / channels_ > max_output_) return 0;
     const auto frames = output.size() / channels_;
-    std::fill(output.begin(), output.end(), 0);
+    std::fill(output.begin(), output.end(), 0.0F);
     stats_.output_frames += frames;
     if (!frames) return 0;
     if (!started_) {

@@ -200,17 +200,17 @@ void src_tests() {
             const std::size_t target=in_rate/20;
             const std::size_t block=out_rate/100;
             audio::Transport core(in_rate,out_rate,1,target*4,target,block);
-            std::vector<float> capture(in_rate/100+10,0.1F), output(block);
+            std::vector<float> capture(in_rate/100+10,0.1F), transport_output(block);
             double fraction=0;
             for(int cycle=0;cycle<500;++cycle) {
                 fraction+=double(in_rate)/100*(1+ppm*1e-6);
                 const auto count=static_cast<std::size_t>(fraction);
                 fraction-=static_cast<double>(count);
                 CHECK(core.push(std::span(capture).first(count)));
-                core.render(output);
+                core.render(transport_output);
                 CHECK(core.queued_input()<=static_cast<double>(core.capacity()));
                 CHECK(core.internal_input()<=double(in_rate)/100+2000);
-                for(float x:output) CHECK(std::isfinite(x));
+                for(float x:transport_output) CHECK(std::isfinite(x));
             }
             CHECK(core.statistics().underflows==0); CHECK(core.statistics().overflows==0);
             CHECK(core.statistics().resyncs==0); CHECK(core.statistics().src_errors==0);
