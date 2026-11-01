@@ -1,8 +1,104 @@
 # Audio Repeater WASAPI Shared
 
-An independent Windows audio routing project, currently in development.
+An independent Windows audio routing project in development. The portable audio
+core and automated tests are available. Endpoint routing and a user interface are
+not implemented yet. There is no application executable to download at this stage.
 
-The application is not available yet. Real-device audio behavior and any latency
-benefit relative to other implementations are unverified.
+Real-device audio operation, end-to-end latency, and any latency difference versus
+the MME version of Audio Repeater are unverified. A passing synthetic test or hosted
+build does not establish audible routing or a latency benefit.
 
-Project source is licensed under the MIT license. See [LICENSE](LICENSE).
+## Build the core
+
+Requires CMake 3.26+, a C++20 compiler and a C99 compiler. The dependency is vendored;
+configuration does not download code. Windows x64 uses Visual Studio 2022 and the
+Windows SDK. The Windows workflow logs the selected compiler, SDK and hosted image.
+
+Linux:
+
+```sh
+cmake -S . -B build-core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-core
+ctest --test-dir build-core --output-on-failure --no-tests=error
+```
+
+Windows:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure --no-tests=error
+```
+
+Use `BUILD_TESTING=OFF` for the static production core without allocator hooks.
+Own code builds with warnings as errors; vendor warnings are isolated. Windows
+uses the static C/C++ runtime. No external audio DLL or libsndfile is needed.
+
+## Core contract
+
+`src/audio_core.h` contains the single-thread owned processing API. Configuration
+and construction allocate before streaming. Processing does not allocate, lock,
+log, perform I/O, or access devices.
+
+- Formats: little endian interleaved float32, PCM16, packed PCM24, and PCM32 with
+  24 or 32 valid bits. Valid24 in PCM32 is left aligned; unused low bits are ignored.
+  Rates are 8–192 kHz. Mono/stereo use unspecified masks or front-center / front-left
+  and front-right masks. Other masks, channels, alignments and valid bits are rejected.
+  Windows format structure validation belongs to the future endpoint adapter.
+- Mono to stereo duplicates; stereo to mono averages left and right. Nonfinite
+  samples become zero. Integer encoding rounds to nearest (ties away from zero)
+  and saturates. Float values retain finite headroom; nonfinite SRC output becomes
+  zero. Integer conversion has no dither. Conversion spans must not overlap.
+- The fixed FIFO returns actual partial frame counts. `Transport` treats exceeding
+  its combined FIFO/SRC capacity as an overflow, counts dropped frames, resets the
+  SRC/controller, and starts prefill again. Discontinuity performs the same reset
+  and has its own counter. Steady underflow zero fills and explicitly resynchronizes.
+  Startup silence is counted separately. Invalid processing extents return failure.
+- SRC uses persistent `src_process`, actual input/output counts and live
+  `end_of_input=0`. It feeds only output demand plus fixed lookahead. Queue size is
+  visible FIFO plus SRC input accepted minus generated output's input phase advance.
+  This includes frames hidden in SRC, rather than reporting only the external FIFO.
+- Drift feedback compares the combined queue with its configured target. Increasing
+  queue increases input-clock correction and reduces `outRate/inRate` accordingly.
+  Updates occur at most 10 Hz, with a 1-second exponential error filter, PI feedback,
+  conditional antiwindup, a 200 ppm/second slew limit, and ±2000 ppm input-clock
+  correction bounds. Ratio is `nominal_ratio / (1 + correction_ppm / 1e6)`.
+  Reset clears controller history. Recovery outside that range can cause silence
+  or discarded frames and is counted explicitly.
+
+`Transport` requires a target larger than one maximum output request converted to
+input frames plus SRC lookahead, and capacity at least four times the target.
+The caller supplies a maximum render request and processes all operations on one
+thread. These are implementation bounds, not measured latency settings.
+
+## Automated verification
+
+CTest runs without audio hardware and fails on an empty suite. Checks use explicit
+failure exits in Release builds. Seed `0x5A17C0DE` is fixed and printed with counts.
+Use `ctest --test-dir build-core --verbose` to retain full numeric results in CTest's
+`Testing/Temporary/LastTest.log`.
+
+Tests cover queue wraparound and randomized chunks, format boundaries, mapping,
+nonfinite samples, silence, invalid formats, equal and 44.1↔48 kHz conversion,
+impulse position and startup filter lookahead, chunk independence, and 8↔192 kHz
+including ±2000 ppm. Fixed 0.25-amplitude tones use a rectangular coherent window
+from 0.5 to 1.5 seconds: gain at 1/5/10 kHz must be within ±0.2 dB for 44.1↔48 kHz;
+a 96→48 kHz conversion of 30 kHz must yield an 18 kHz alias at most −60 dB.
+These are specific signal checks, not proof of full-band transparency.
+
+Six actual SRC transport simulations run ±100/500/2000 ppm for 30 minutes of virtual
+time at 8 kHz, using irregular capture chunks and 10 ms render requests. After a
+30-second warm-up they require zero underflow, overflow and resync, bounded queue,
+and no sustained queue growth. Out-of-range clocks and discontinuities must trigger
+explicit recovery. C and C++ allocation hooks cover core and vendor processing,
+ratio changes and resets after warm-up. Actual compiled reverse-feedback and
+capacity-guard mutations must fail tests that also pass on the unmodified core.
+
+## Dependency and license
+
+Project code uses the [MIT license](LICENSE). Vendored libsamplerate uses
+BSD-2-Clause. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and its
+[provenance manifest](third_party/libsamplerate/PROVENANCE.md) for the immutable
+revision, checked source hashes and build settings. `SRC_SINC_FASTEST` has a
+bandwidth tradeoff (upstream documents 80% relative bandwidth); conversion is not
+bit-perfect and is not presented as full-band transparent.

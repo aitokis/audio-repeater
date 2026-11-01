@@ -1,0 +1,31 @@
+name: Windows core
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: windows-core-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  core:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Hosted image and tools
+        shell: pwsh
+        run: |
+          Write-Output "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -format json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+      - name: Build Release
+        run: cmake --build build --config Release
+      - name: Test Release
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error --verbose
