@@ -1,12 +1,51 @@
 # Audio Repeater WASAPI Shared
 
-An independent Windows audio routing project in development. The portable audio
-core, a WASAPI Shared routing engine, and a finite command-line executable are
-available. A graphical interface and downloadable distribution are still in development.
+An independent Windows 10/11 x64 application that transfers one capture endpoint
+to one render endpoint using WASAPI Shared. It has a native single-window interface,
+a bounded audio transport, and finite command-line diagnostics.
 
 Real-device audio operation, end-to-end latency, and any latency difference versus
 the MME version of Audio Repeater are unverified. A passing synthetic test or hosted
 build does not establish audible routing or a latency benefit.
+
+## Download and use
+
+Open a successful [Windows application Actions run](https://github.com/aitokis/audio-repeater/actions)
+and download its `audio-repeater-windows-x64-<source SHA>` artifact (GitHub login
+may be required). Extract the outer Actions download, then the application ZIP.
+The ZIP contains `audio-repeater.exe`, this README, `LICENSE`,
+`THIRD_PARTY_NOTICES.md`, `SOURCE_SHA.txt`, and `SHA256SUMS`. Check the source SHA
+against the run and use `Get-FileHash -Algorithm SHA256` to compare files with
+`SHA256SUMS`. The run also prints the ZIP checksum and inspected contents.
+Artifacts expire after 30 days; these builds are unsigned and are not GitHub Releases.
+No installer, external audio DLL, or Visual C++ runtime installation is required.
+
+Double-click `audio-repeater.exe` to open the GUI:
+
+1. Select an input (capture) and output (render) endpoint. The details box shows
+   their endpoint IDs; selections survive Refresh by ID, including duplicate names.
+2. Choose **Low latency** (minimum legal period) or **Stable** (default period and
+   larger queue), then **Start**. These are design settings, not latency guarantees.
+3. Use **Stop** before changing settings. Closing the window stops and joins the
+   worker before destroying it. The settings stay disabled during startup/routing.
+4. After a device error, use **Refresh**, reselect endpoints, then **Start**. A missing
+   selection is not silently switched to another device. Empty device lists explain
+   the problem, disable Start, and leave Refresh available.
+
+Status and details update four times per second. They show actual native formats,
+requested/supported/current periods, buffer frames, fallback HRESULT, MMCSS,
+FIFO/SRC queue time, drift correction, underflow/overflow/discontinuity/timestamp
+errors, resyncs, discarded frames and startup silence. Queue time includes SRC
+backlog. It and API stream latency are diagnostics, not end-to-end measurements.
+Use the scrollable details box to inspect values. Tab and access keys navigate controls.
+
+The interface uses English labels. Interactive desktop operation, visual layout,
+audibility, real-device routing/removal and long-running real-device behavior
+remain unverified. Hosted native-window tests are automated message/control tests,
+not evidence of a person operating a Windows desktop. Physical end-to-end latency
+and the difference from MME remain unverified. This project does not implement MME,
+exclusive mode, ASIO, kernel streaming, render-loopback capture, a driver, a tray
+application, or compatibility with the original application's command line.
 
 ## Build
 
@@ -30,7 +69,12 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure --no-tests=error
 ```
 
-Use `BUILD_TESTING=OFF` for a production build without allocator hooks.
+Use `BUILD_TESTING=OFF` for a production build without allocator hooks. Actions
+builds that configuration separately in `build-dist`, packages only explicit
+files, extracts the ZIP into a separate directory, verifies hashes/source identity,
+checks PE imports and path/debug-data exclusions, and executes that extracted
+application's self-test and native-window test. The downloadable ZIP is this
+production build, not a core-test executable.
 Own code builds with warnings as errors; vendor warnings are isolated. Windows
 uses the static C/C++ runtime. No external audio DLL or libsndfile is needed.
 
@@ -72,7 +116,13 @@ queue including SRC, recovery counters, and startup silence are reported separat
 
 CTest smoke commands each have a ten-second limit and capture redirected output
 from the GUI-subsystem executable. Windows Actions also invokes the application's
-self-test directly. Fake sessions exercise failed startup, restart after failure,
+self-test directly. `audio-repeater.exe --gui-self-test` creates the actual native
+window and drives its message loop. It reports native endpoint counts, then uses
+synthetic empty lists/IDs to check empty-state controls, ID-based selection after
+reordering/removal, settings locks, a real invalid-endpoint startup failure,
+restart, repeated Stop, and close during startup with join. It requires window
+creation but no human interaction or audio hardware. It does not claim routing.
+Fake sessions exercise failed startup, restart after failure,
 repeated stop, close while running, cancellation during initialization, invalidation,
 and absent events. Hardware routing, device removal, audible output, and long-running
 real-device behavior remain unverified.
