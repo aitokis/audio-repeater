@@ -1,14 +1,14 @@
 # Audio Repeater WASAPI Shared
 
 An independent Windows audio routing project in development. The portable audio
-core and automated tests are available. Endpoint routing and a user interface are
-not implemented yet. There is no application executable to download at this stage.
+core, a WASAPI Shared routing engine, and a finite command-line executable are
+available. A graphical interface and downloadable distribution are still in development.
 
 Real-device audio operation, end-to-end latency, and any latency difference versus
 the MME version of Audio Repeater are unverified. A passing synthetic test or hosted
 build does not establish audible routing or a latency benefit.
 
-## Build the core
+## Build
 
 Requires CMake 3.26+, a C++20 compiler and a C99 compiler. The dependency is vendored;
 configuration does not download code. Windows x64 uses Visual Studio 2022 and the
@@ -30,9 +30,52 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure --no-tests=error
 ```
 
-Use `BUILD_TESTING=OFF` for the static production core without allocator hooks.
+Use `BUILD_TESTING=OFF` for a production build without allocator hooks.
 Own code builds with warnings as errors; vendor warnings are isolated. Windows
 uses the static C/C++ runtime. No external audio DLL or libsndfile is needed.
+
+## Command-line application (Windows)
+
+```powershell
+build/Release/audio-repeater.exe --self-test
+build/Release/audio-repeater.exe --list-devices
+build/Release/audio-repeater.exe --probe --input-id "CAPTURE_ENDPOINT_ID" --output-id "RENDER_ENDPOINT_ID" --duration-ms 1000 --preset low-latency
+```
+
+Use IDs from `--list-devices`, which reports active capture and render endpoints,
+native formats, unsupported formats, and explicit empty lists. `--self-test` uses
+fake sessions and requires no audio device; it does not demonstrate audible routing.
+The probe runs for 1–5000 ms (default 1000) including startup, then requests stop and
+joins the worker. Invalid arguments return 2, API errors return 3, and an incomplete
+startup returns 4. It never changes endpoints automatically or retries indefinitely.
+After invalidation, enumerate again and choose endpoints before restarting.
+
+The low-latency preset requests the smallest legal IAudioClient3 period; `stable`
+requests its reported default. Requests must be fundamental-period multiples in
+range. If negotiation or initialization fails, a fresh client attempts ordinary
+shared/event initialization once. Diagnostics distinguish the requested period,
+actual buffer frames, queried current engine period (or `unavailable`), default
+device period, API stream latency, and fallback HRESULT. These values are not
+measured end-to-end latency. Native mix formats are used without automatic system
+format conversion. Only the formats and channel layouts described below are accepted.
+
+One worker owns COM and both streams. It drains at most eight capture packets per
+wake with cancellation checks, pre-fills before starting render, and only writes
+within `buffer_frames - padding`. Silent capture packets are never dereferenced.
+Capture discontinuities reset the transport; timestamp errors have separate counters.
+The initial target uses the larger endpoint period (twice that for `stable`), with a
+safety floor of one maximum render request plus SRC lookahead. The fixed capacity
+includes at least four targets and capture-packet headroom. Buffers over half a
+second and transport capacities over two input seconds are rejected at startup.
+This conservative floor can exceed the requested period. MMCSS registration status,
+queue including SRC, recovery counters, and startup silence are reported separately.
+
+CTest smoke commands each have a ten-second limit and capture redirected output
+from the GUI-subsystem executable. Windows Actions also invokes the application's
+self-test directly. Fake sessions exercise failed startup, restart after failure,
+repeated stop, close while running, cancellation during initialization, invalidation,
+and absent events. Hardware routing, device removal, audible output, and long-running
+real-device behavior remain unverified.
 
 ## Core contract
 
@@ -44,7 +87,7 @@ log, perform I/O, or access devices.
   24 or 32 valid bits. Valid24 in PCM32 is left aligned; unused low bits are ignored.
   Rates are 8–192 kHz. Mono/stereo use unspecified masks or front-center / front-left
   and front-right masks. Other masks, channels, alignments and valid bits are rejected.
-  Windows format structure validation belongs to the future endpoint adapter.
+  The Windows adapter also validates the native mix format structure and byte rate.
 - Mono to stereo duplicates; stereo to mono averages left and right. Nonfinite
   samples become zero. Integer encoding rounds to nearest (ties away from zero)
   and saturates. Float values retain finite headroom; nonfinite SRC output becomes
