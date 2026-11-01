@@ -1,5 +1,6 @@
 #include "wasapi_engine.h"
 #include <shellapi.h>
+#include <objbase.h>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
