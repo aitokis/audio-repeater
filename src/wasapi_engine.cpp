@@ -1,6 +1,7 @@
 #include "wasapi_engine.h"
 #include <audioclient.h>
 #include <avrt.h>
+#include <propsys.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <ks.h>
 #include <ksmedia.h>

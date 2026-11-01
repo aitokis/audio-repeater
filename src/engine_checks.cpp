@@ -26,10 +26,10 @@ struct FakeClient {
     std::int32_t initialize_legacy() { require(live == 2); ++legacy; return legacy_result; }
 };
 enum class Mode { normal, setup_failure, capture_start_failure, capture_failure,
-                  render_start_failure, render_failure, wait_failure, blocked_setup, no_audio };
+                  render_start_failure, render_failure, wait_failure, blocked_setup, blocked_wait, no_audio };
 struct Audit {
     std::atomic<int> made{}, initialized{}, capture_started{}, render_started{}, captured{}, rendered{}, stopped{}, destroyed{};
-    std::atomic<bool> wrong_thread{};
+    std::atomic<bool> wrong_thread{}, waiting{};
     Mode mode{Mode::normal};
 };
 class FakeSession final : public Session {
@@ -51,6 +51,12 @@ public:
     Wake wait() noexcept override {
         own();
         if (audit_.mode == Mode::wait_failure) return Wake::failed;
+        if (audit_.mode == Mode::blocked_wait) {
+            audit_.waiting = true;
+            std::unique_lock lock(mutex_);
+            condition_.wait(lock, token_, [] { return false; });
+            return Wake::stopped;
+        }
         if (audit_.mode == Mode::no_audio) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1)); return Wake::idle;
         }
@@ -106,6 +112,12 @@ void lifecycle() {
         Worker worker([&] { return std::make_unique<FakeSession>(a); });
         worker.start(); await([&] { return a.initialized == 1; }); worker.stop();
         require(a.capture_started == 0 && a.render_started == 0 && a.destroyed == 1 && !a.wrong_thread);
+    }
+    { // Stop must wake a worker blocked waiting for its next audio event.
+        Audit a; a.mode = Mode::blocked_wait;
+        Worker worker([&] { return std::make_unique<FakeSession>(a); });
+        worker.start(); await([&] { return a.waiting.load(); }); worker.stop();
+        require(a.destroyed == 1 && a.stopped == 1 && !a.wrong_thread);
     }
     { // Destroying/closing a running owner cancels and joins before returning.
         Audit a;
