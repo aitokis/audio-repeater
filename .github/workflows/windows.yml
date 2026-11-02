@@ -1,0 +1,60 @@
+name: Windows application
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: windows-application-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Hosted image and tools
+        shell: pwsh
+        run: |
+          Write-Output "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -format json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+      - name: Build Release
+        run: cmake --build build --config Release
+      - name: Test Release
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+      - name: Application self-test
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath build/Release/audio-repeater.exe -ArgumentList '--self-test' -NoNewWindow -PassThru -RedirectStandardOutput self-test.txt -RedirectStandardError self-test-error.txt
+          if (-not $process.WaitForExit(8000)) { $process.Kill(); throw 'Self-test exceeded 8 seconds' }
+          Get-Content self-test.txt
+          Get-Content self-test-error.txt
+          if ($process.ExitCode -ne 0) { throw "Self-test exit $($process.ExitCode)" }
+          if (-not (Select-String -Path self-test.txt -Pattern 'self-test: passed' -Quiet)) { throw 'Self-test output missing' }
+      - name: Finite CLI smoke tests
+        run: ctest --test-dir build -C Release -R smoke --output-on-failure --no-tests=error --verbose
+      - name: Configure production application
+        run: cmake -S . -B build-dist -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=OFF
+      - name: Build production application
+        run: cmake --build build-dist --config Release
+      - name: Package and verify extracted application
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: ./cmake/package.ps1 -SourceSha $env:SOURCE_SHA
+      - name: Upload application
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audio-repeater-windows-x64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/audio-repeater-windows-x64-*.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
