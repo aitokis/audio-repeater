@@ -29,8 +29,10 @@ Double-click `audio-repeater.exe` to open the GUI:
 3. Use **Stop** before changing settings. Closing the window stops and joins the
    worker before destroying it. The settings stay disabled during startup/routing.
 4. After a device error, use **Refresh**, reselect endpoints, then **Start**. A missing
-   selection is not silently switched to another device. Empty device lists explain
-   the problem, disable Start, and leave Refresh available.
+   selection is not silently switched to another device, even after repeated Refresh
+   or an empty list. Its ID is restored if it returns; selecting another endpoint
+   explicitly replaces it. Empty device lists explain the problem, disable Start,
+   and leave Refresh available.
 
 Status and details update four times per second. They show actual native formats,
 requested/supported/current periods, buffer frames, fallback HRESULT, MMCSS,

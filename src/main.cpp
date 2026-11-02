@@ -87,6 +87,9 @@ struct Window {
     HINSTANCE instance;
     HWND hwnd{}, input{}, output{}, preset{}, refresh_button{}, start_button{}, stop_button{}, status{}, details{};
     std::vector<audio::Endpoint> inputs, outputs;
+    // Empty means no endpoint has ever been selected. Keep an absent ID across
+    // Refresh so a missing selection cannot become an unrelated initial choice.
+    std::wstring input_selection, output_selection;
     std::unique_ptr<audio::Worker> worker;
     bool active{}, testing{}, passed{};
     unsigned test_step{}, ticks{};
@@ -109,7 +112,7 @@ struct Window {
         return index >= 0 && static_cast<std::size_t>(index) < endpoints.size() &&
             !endpoints[static_cast<std::size_t>(index)].format_error;
     }
-    static void fill(HWND combo, const std::vector<audio::Endpoint>& endpoints, const std::wstring& previous) {
+    static void fill(HWND combo, const std::vector<audio::Endpoint>& endpoints, std::wstring& previous) {
         SendMessageW(combo, CB_RESETCONTENT, 0, 0);
         int index = previous.empty() && !endpoints.empty() ? 0 : -1;
         for (std::size_t i = 0; i < endpoints.size(); ++i) {
@@ -119,6 +122,7 @@ struct Window {
             if (endpoints[i].id == previous) index = static_cast<int>(i);
         }
         SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(index), 0);
+        if (index >= 0) previous = endpoints[static_cast<std::size_t>(index)].id;
     }
     void enable() {
         for (auto c : {input, output, preset, refresh_button}) EnableWindow(c, !active);
@@ -141,17 +145,16 @@ struct Window {
     void refresh() {
         if (active) return;
         worker.reset();
-        const auto old_input = selected(input, inputs), old_output = selected(output, outputs);
         inputs.clear(); outputs.clear();
         try {
             inputs = audio::enumerate_endpoints(true);
             outputs = audio::enumerate_endpoints(false);
         } catch (const audio::WasapiError& e) {
-            fill(input, inputs, old_input); fill(output, outputs, old_output); enable();
+            fill(input, inputs, input_selection); fill(output, outputs, output_selection); enable();
             SetWindowTextW(status, (L"Device enumeration failed: " + hex(e.code) + L". Refresh to retry.").c_str());
             return;
         }
-        fill(input, inputs, old_input); fill(output, outputs, old_output);
+        fill(input, inputs, input_selection); fill(output, outputs, output_selection);
         selection_status();
     }
     void start() {
@@ -220,20 +223,56 @@ struct Window {
                 L" outputs=" + std::to_wstring(outputs.size()) + L" (no routing claim).\n");
             // Deterministic empty-state test uses the same real controls. Native
             // enumeration above is reported separately from these synthetic IDs.
-            inputs.clear(); outputs.clear(); fill(input, inputs, L""); fill(output, outputs, L""); selection_status();
+            inputs.clear(); outputs.clear(); fill(input, inputs, input_selection); fill(output, outputs, output_selection); selection_status();
             wchar_t text[256]{}; GetWindowTextW(status, text, 256);
             require(std::wstring_view(text).find(L"No active input endpoints") != std::wstring_view::npos);
             require(!IsWindowEnabled(start_button) && IsWindowEnabled(refresh_button) && IsWindowEnabled(preset));
             SendMessageW(hwnd, WM_COMMAND, refresh_id, 0);
             require(!active && IsWindowEnabled(refresh_button));
-            inputs = {{L"nonexistent-input-0", L"Duplicate name", {}, 0}, {L"nonexistent-input-1", L"Duplicate name", {}, 0}};
+            // Feed synthetic enumeration results into the production fill path.
+            // Both sides use real controls and the real selection notification.
+            input_selection.clear(); output_selection.clear();
+            inputs = {{L"nonexistent-input", L"Synthetic input", {}, 0}};
             outputs = {{L"nonexistent-output", L"Synthetic output", {}, 0}};
-            fill(input, inputs, L"nonexistent-input-1"); fill(output, outputs, L"");
-            std::reverse(inputs.begin(), inputs.end());
-            fill(input, inputs, L"nonexistent-input-1");
-            require(selected(input, inputs) == L"nonexistent-input-1");
-            fill(input, inputs, L"removed-id"); require(selected(input, inputs).empty());
-            fill(input, inputs, L"nonexistent-input-1"); selection_status();
+            fill(input, inputs, input_selection); fill(output, outputs, output_selection);
+            for (const bool capture : {true, false}) {
+                const auto combo = capture ? input : output;
+                auto& endpoints = capture ? inputs : outputs;
+                auto& remembered = capture ? input_selection : output_selection;
+                const auto id = capture ? input_id : output_id;
+                const std::vector<audio::Endpoint> pair{
+                    {L"nonexistent-A", L"Duplicate name", {}, 0}, {L"nonexistent-B", L"Duplicate name", {}, 0}};
+                auto refill = [&](const std::vector<audio::Endpoint>& next) {
+                    endpoints = next;
+                    fill(combo, endpoints, remembered);
+                    selection_status();
+                };
+                auto choose = [&](WPARAM index) {
+                    SendMessageW(combo, CB_SETCURSEL, index, 0);
+                    SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(id, CBN_SELCHANGE), reinterpret_cast<LPARAM>(combo));
+                };
+                remembered.clear();
+                refill({}); refill({}); refill(pair);
+                require(selected(combo, endpoints) == L"nonexistent-A"); // first available list only
+                choose(1);
+                require(remembered == L"nonexistent-B");
+                refill({pair[1], pair[0]});
+                require(selected(combo, endpoints) == L"nonexistent-B" && IsWindowEnabled(start_button));
+                refill({pair[0]}); refill({pair[0]});
+                require(selected(combo, endpoints).empty() && remembered == L"nonexistent-B" && !IsWindowEnabled(start_button));
+                refill(pair);
+                require(selected(combo, endpoints) == L"nonexistent-B" && IsWindowEnabled(start_button));
+                refill({}); refill({}); refill({pair[0]});
+                require(selected(combo, endpoints).empty() && remembered == L"nonexistent-B" && !IsWindowEnabled(start_button));
+                refill(pair);
+                require(selected(combo, endpoints) == L"nonexistent-B" && IsWindowEnabled(start_button));
+                refill({pair[0]}); choose(0); // explicit replacement while B is absent
+                require(remembered == L"nonexistent-A" && IsWindowEnabled(start_button));
+                refill({pair[1], pair[0]}); refill({}); refill(pair);
+                require(selected(combo, endpoints) == L"nonexistent-A" && IsWindowEnabled(start_button));
+                write(std::wstring(capture ? L"Input" : L"Output") +
+                    L" selection regression: passed (initial empty, duplicate names/reorder, repeated removal Refresh, empty-list return, ID reappearance, explicit reselection).\n");
+            }
             SendMessageW(hwnd, WM_COMMAND, start_id, 0);
             require(active && !IsWindowEnabled(input) && !IsWindowEnabled(output) && !IsWindowEnabled(preset) &&
                 !IsWindowEnabled(refresh_button) && !IsWindowEnabled(start_button) && IsWindowEnabled(stop_button));
@@ -266,7 +305,13 @@ struct Window {
                 case start_id: self->start(); break;
                 case stop_id: self->stop(); break;
                 case input_id: case output_id:
-                    if (HIWORD(wp) == CBN_SELCHANGE && !self->active) { self->worker.reset(); self->selection_status(); }
+                    if (HIWORD(wp) == CBN_SELCHANGE && !self->active) {
+                        auto& remembered = LOWORD(wp) == input_id ? self->input_selection : self->output_selection;
+                        const auto current = selected(LOWORD(wp) == input_id ? self->input : self->output,
+                            LOWORD(wp) == input_id ? self->inputs : self->outputs);
+                        if (!current.empty()) remembered = current;
+                        self->worker.reset(); self->selection_status();
+                    }
                     break;
                 }
                 return 0;
