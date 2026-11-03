@@ -156,8 +156,7 @@ public:
             const double period = std::max(period_seconds(input_.info), period_seconds(output_.info));
             // The core requires room for one maximum render request plus filter
             // lookahead; this safety floor can exceed the period-based starting target.
-            target_ = std::max(demand + lookahead + 1, static_cast<std::size_t>(std::ceil(
-                period * in_rate * (settings_.preset == Preset::stable ? 2 : 1))));
+            target_ = select_queue_target(in_rate, demand + lookahead + 1, period, settings_.preset);
             const auto capacity = 4 * target_ + input_.info.buffer_frames + lookahead;
             if (target_ > in_rate / 2 || capacity > in_rate * 2 || capacity > 1'000'000)
                 return E_INVALIDARG;

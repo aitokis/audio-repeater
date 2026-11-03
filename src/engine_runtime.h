@@ -15,6 +15,8 @@ enum class Preset { low_latency, stable };
 enum class ShareMode { shared, exclusive };
 struct Periods { std::uint32_t normal{}, fundamental{}, minimum{}, maximum{}; };
 std::uint32_t select_period(Periods, Preset) noexcept;
+std::size_t select_queue_target(unsigned input_rate, std::size_t minimum_frames,
+                              double period_seconds, Preset) noexcept;
 bool engine_self_test();
 struct StreamInfo {
     Format format{};

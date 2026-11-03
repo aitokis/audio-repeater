@@ -136,8 +136,9 @@ releasing an unacquired buffer. Each direction permits three consecutive errors;
 the fourth stops with that HRESULT. Successful acquisition clears that direction's
 streak. Initial render prefill and shared-mode failures stop immediately.
 Capture discontinuities reset the transport; timestamp errors have separate counters.
-The initial target uses the larger endpoint period (twice that for `stable`), with a
-safety floor of one maximum render request plus SRC lookahead. The fixed capacity
+The initial target is at least 12 ms of input (576 frames at 48 kHz). It also covers
+the larger endpoint period (twice that for `stable`) and one maximum render request
+plus SRC lookahead, retaining whichever requirement is largest. The fixed capacity
 includes at least four targets and capture-packet headroom. Buffers over half a
 second and transport capacities over two input seconds are rejected at startup.
 This conservative floor can exceed the requested period. MMCSS registration status,
@@ -181,7 +182,9 @@ log, perform I/O, or access devices.
 - The fixed FIFO returns actual partial frame counts. `Transport` treats exceeding
   its combined FIFO/SRC capacity as an overflow, counts dropped frames, resets the
   SRC/controller, and starts prefill again. Discontinuity performs the same reset
-  and has its own counter. Steady underflow zero fills and explicitly resynchronizes.
+  and has its own counter. Steady underflow keeps the generated output prefix and
+  zero pads only its missing tail, preserving queued audio, SRC history, priming
+  and drift-controller state. SRC errors still reset the transport.
   Startup silence is counted separately. Invalid processing extents return failure.
 - SRC uses persistent `src_process`, actual input/output counts and live
   `end_of_input=0`. It feeds only output demand plus fixed lookahead. Queue size is
@@ -192,8 +195,9 @@ log, perform I/O, or access devices.
   Updates occur at most 10 Hz, with a 1-second exponential error filter, PI feedback,
   conditional antiwindup, a 200 ppm/second slew limit, and ±2000 ppm input-clock
   correction bounds. Ratio is `nominal_ratio / (1 + correction_ppm / 1e6)`.
-  Reset clears controller history. Recovery outside that range can cause silence
-  or discarded frames and is counted explicitly.
+  The controller remains active when nominal input/output rates match. Discontinuity,
+  overflow or SRC-error recovery clears controller history; ordinary underflow does
+  not. Clocks outside the correction range can cause counted silence or overflow.
 
 `Transport` requires a target larger than one maximum output request converted to
 input frames plus SRC lookahead, and capacity at least four times the target.
@@ -218,8 +222,12 @@ These are specific signal checks, not proof of full-band transparency.
 Six actual SRC transport simulations run ±100/500/2000 ppm for 30 minutes of virtual
 time at 8 kHz, using irregular capture chunks and 10 ms render requests. After a
 30-second warm-up they require zero underflow, overflow and resync, bounded queue,
-and no sustained queue growth. Out-of-range clocks and discontinuities must trigger
-explicit recovery. C and C++ allocation hooks cover core and vendor processing,
+and no sustained queue growth. Two more five-minute runs use equal nominal 48 kHz
+rates, 144-frame requests, a 576-frame target and ±500 ppm, checking correction sign
+and convergence. Repeated partial/full underruns check zero tails, retained audio
+against a persistent SRC, sub-target resumption and continuing controller updates.
+Out-of-range slow capture pads shortages; overflow and discontinuities still reset.
+C and C++ allocation hooks cover core and vendor processing,
 ratio changes and resets after warm-up. Actual compiled reverse-feedback and
 capacity-guard mutations must fail tests that also pass on the unmodified core.
 

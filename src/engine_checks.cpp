@@ -380,6 +380,12 @@ bool engine_self_test() {
         require(select_period({480,48,100,120}, Preset::low_latency) == 0);
         require(select_period({480,48,960,100}, Preset::low_latency) == 0);
         require(select_period({480,0xFFFFFFFFU,0xFFFFFFFEU,0xFFFFFFFEU}, Preset::low_latency) == 0);
+        require(select_queue_target(48000,275,0.003,Preset::low_latency) == 576);
+        require(select_queue_target(48000,275,0.003,Preset::stable) == 576);
+        require(select_queue_target(44100,250,0.003,Preset::low_latency) == 530);
+        require(select_queue_target(48000,1100,0.003,Preset::low_latency) == 1100);
+        require(select_queue_target(48000,275,0.020,Preset::low_latency) == 960);
+        require(select_queue_target(48000,275,0.010,Preset::stable) == 960);
         { FakeClient c; StreamInfo info;
           require(initialize_shared(c, Preset::low_latency, info) == 0);
           require(info.client3 && info.requested_frames == 144 && !info.fallback_reason && c.activations == 1 && c.legacy == 0); }

@@ -1,5 +1,7 @@
 #include "engine_runtime.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 
 namespace audio {
@@ -10,6 +12,12 @@ std::uint32_t select_period(Periods p, Preset preset) noexcept {
     if (preset == Preset::stable && rounded != p.normal) return 0;
     if (rounded < p.minimum || rounded > p.maximum || rounded > std::numeric_limits<std::uint32_t>::max()) return 0;
     return static_cast<std::uint32_t>(rounded);
+}
+std::size_t select_queue_target(unsigned input_rate, std::size_t minimum_frames,
+                              double period_seconds, Preset preset) noexcept {
+    // A 12 ms floor leaves scheduling headroom even for very short device periods.
+    return std::max({minimum_frames, (std::size_t(input_rate) * 12 + 999) / 1000,
+        static_cast<std::size_t>(std::ceil(period_seconds * input_rate * (preset == Preset::stable ? 2 : 1)))});
 }
 void Worker::start() {
     stop();

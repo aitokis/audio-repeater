@@ -253,7 +253,7 @@ std::size_t Transport::render(std::span<float> output) noexcept {
         fifo_.peek(std::span<float>(scratch_.data(), feed * channels_));
         const auto result = src_.process(std::span<const float>(scratch_.data(), feed * channels_),
                                         output.subspan(generated * channels_), ratio);
-        if (result.error) { ++stats_.src_errors; break; }
+        if (result.error) { ++stats_.src_errors; recover(); break; }
         fifo_.discard(result.consumed);
         stats_.consumed_frames += result.consumed;
         stats_.generated_frames += result.generated;
@@ -263,7 +263,8 @@ std::size_t Transport::render(std::span<float> output) noexcept {
     if (generated < frames) {
         ++stats_.underflows;
         stats_.silent_frames += frames - generated;
-        recover();
+        // Output was zeroed before processing. Keep its generated prefix and
+        // retain FIFO, SRC, priming and drift history for the next capture packet.
     }
     return generated;
 }
