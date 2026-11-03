@@ -15,9 +15,11 @@ struct Endpoint {
 // The caller initializes COM in its apartment for this finite enumeration.
 std::vector<Endpoint> enumerate_endpoints(bool capture);
 Format native_format(const WAVEFORMATEX&);
+WAVEFORMATEXTENSIBLE exclusive_wave_format(const Format&, bool extensible) noexcept;
 struct Settings {
     std::wstring input_id, output_id;
     Preset preset{Preset::low_latency};
+    ShareMode mode{ShareMode::shared};
 };
 std::unique_ptr<Session> make_wasapi_session(Settings);
 bool engine_self_test();

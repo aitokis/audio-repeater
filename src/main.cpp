@@ -42,15 +42,19 @@ std::wstring format(const audio::Format& f) {
 }
 std::wstring stream_info(const wchar_t* name, const audio::StreamInfo& s) {
     std::wostringstream out;
-    out << name << L": " << format(s.format)
+    out << name << L": mode=" << (s.mode == audio::ShareMode::exclusive ? L"exclusive" : L"shared") << L" "
+        << (s.format.valid() ? format(s.format) : L"format unavailable")
         << L"\n  requested_period_frames=" << s.requested_frames
         << L" supported_default/fundamental/min/max=" << s.supported.normal << L"/" << s.supported.fundamental
         << L"/" << s.supported.minimum << L"/" << s.supported.maximum
         << L"\n  actual_buffer_frames=" << s.buffer_frames << L" actual_period_frames=";
     if (s.actual_period_frames) out << s.actual_period_frames;
     else out << L"unavailable";
-    out << L" default_period_100ns=" << s.default_period_100ns << L" API_stream_latency_100ns=" << s.latency_100ns
-        << L"\n  initialization=" << (!s.initialized ? L"not completed" : s.client3 ? L"IAudioClient3" : L"shared/event fallback")
+    out << L" default_period_100ns=" << s.default_period_100ns << L" minimum_period_100ns=" << s.minimum_period_100ns
+        << L" requested_period_100ns=" << s.requested_period_100ns << L" alignment_retry=" << s.alignment_retry
+        << L" API_stream_latency_100ns=" << s.latency_100ns
+        << L"\n  initialization=" << (!s.initialized ? L"not completed" : s.mode == audio::ShareMode::exclusive ? L"exclusive/event" :
+            s.client3 ? L"IAudioClient3" : L"shared/event fallback")
         << L" fallback_reason=" << (s.fallback_reason ? hex(s.fallback_reason) : L"none") << L"\n";
     return out.str();
 }
@@ -72,7 +76,7 @@ std::wstring diagnostics(const audio::Snapshot& s) {
 }
 int usage() {
     write(L"Usage: audio-repeater --self-test | --list-devices | --probe --input-id ID --output-id ID "
-          L"[--duration-ms 1..5000] [--preset low-latency|stable]\n");
+          L"[--duration-ms 1..5000] [--preset low-latency|stable] [--mode shared|exclusive]\n");
     return 2;
 }
 struct Com {
@@ -83,9 +87,9 @@ struct Com {
 // All HWNDs, endpoint values, and Worker start/stop calls belong to this thread.
 // The audio thread never calls UI code or waits for a UI lock.
 struct Window {
-    enum : int { input_id = 101, output_id, preset_id, refresh_id, start_id, stop_id };
+    enum : int { input_id = 101, output_id, preset_id, mode_id, refresh_id, start_id, stop_id };
     HINSTANCE instance;
-    HWND hwnd{}, input{}, output{}, preset{}, refresh_button{}, start_button{}, stop_button{}, status{}, details{};
+    HWND hwnd{}, input{}, output{}, preset{}, mode{}, refresh_button{}, start_button{}, stop_button{}, status{}, details{};
     std::vector<audio::Endpoint> inputs, outputs;
     // Empty means no endpoint has ever been selected. Keep an absent ID across
     // Refresh so a missing selection cannot become an unrelated initial choice.
@@ -107,16 +111,19 @@ struct Window {
         return index >= 0 && static_cast<std::size_t>(index) < endpoints.size()
             ? endpoints[static_cast<std::size_t>(index)].id : L"";
     }
-    static bool supported(HWND combo, const std::vector<audio::Endpoint>& endpoints) {
+    audio::ShareMode selected_mode() const {
+        return SendMessageW(mode, CB_GETCURSEL, 0, 0) == 1 ? audio::ShareMode::exclusive : audio::ShareMode::shared;
+    }
+    bool supported(HWND combo, const std::vector<audio::Endpoint>& endpoints) const {
         const auto index = SendMessageW(combo, CB_GETCURSEL, 0, 0);
         return index >= 0 && static_cast<std::size_t>(index) < endpoints.size() &&
-            !endpoints[static_cast<std::size_t>(index)].format_error;
+            (selected_mode() == audio::ShareMode::exclusive || !endpoints[static_cast<std::size_t>(index)].format_error);
     }
     static void fill(HWND combo, const std::vector<audio::Endpoint>& endpoints, std::wstring& previous) {
         SendMessageW(combo, CB_RESETCONTENT, 0, 0);
         int index = previous.empty() && !endpoints.empty() ? 0 : -1;
         for (std::size_t i = 0; i < endpoints.size(); ++i) {
-            const auto text = endpoints[i].name + (endpoints[i].format_error ? L" (unsupported/unavailable)" : L"");
+            const auto text = endpoints[i].name + (endpoints[i].format_error ? L" (shared format unsupported/unavailable)" : L"");
             if (SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str())) < 0)
                 throw std::runtime_error("CB_ADDSTRING");
             if (endpoints[i].id == previous) index = static_cast<int>(i);
@@ -125,7 +132,7 @@ struct Window {
         if (index >= 0) previous = endpoints[static_cast<std::size_t>(index)].id;
     }
     void enable() {
-        for (auto c : {input, output, preset, refresh_button}) EnableWindow(c, !active);
+        for (auto c : {input, output, preset, mode, refresh_button}) EnableWindow(c, !active);
         EnableWindow(start_button, !active && supported(input, inputs) && supported(output, outputs));
         EnableWindow(stop_button, active);
     }
@@ -138,7 +145,10 @@ struct Window {
             message = L"Select supported input and output endpoints. A removed selection is not replaced automatically.";
         SetWindowTextW(status, message.c_str());
         const auto text = L"Selected input ID: " + selected(input, inputs) + L"\r\nSelected output ID: " + selected(output, outputs) +
-            L"\r\nStart queries actual formats and periods. API/queue values are not measured end-to-end latency.";
+            (selected_mode() == audio::ShareMode::exclusive ?
+                L"\r\nExclusive: input PCM24/48000 Hz, output PCM16/48000 Hz; mono/stereo probed at Start. Other apps may lose device access." :
+                L"\r\nShared: Start queries native mix formats and supported periods.") +
+            L"\r\nAPI/queue values are not measured end-to-end latency.";
         SetWindowTextW(details, text.c_str());
         enable();
     }
@@ -160,7 +170,7 @@ struct Window {
     void start() {
         if (active || !supported(input, inputs) || !supported(output, outputs)) return;
         audio::Settings settings{selected(input, inputs), selected(output, outputs),
-            SendMessageW(preset, CB_GETCURSEL, 0, 0) == 1 ? audio::Preset::stable : audio::Preset::low_latency};
+            SendMessageW(preset, CB_GETCURSEL, 0, 0) == 1 ? audio::Preset::stable : audio::Preset::low_latency, selected_mode()};
         worker = std::make_unique<audio::Worker>([settings] { return audio::make_wasapi_session(settings); });
         worker->start();
         active = true; enable();
@@ -206,12 +216,17 @@ struct Window {
         SendMessageW(preset, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Low latency (minimum legal period)"));
         SendMessageW(preset, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Stable (default period, larger queue)"));
         SendMessageW(preset, CB_SETCURSEL, 0, 0);
-        refresh_button = control(L"BUTTON", L"&Refresh", WS_TABSTOP, refresh_id, 310, 160, 110, 28);
-        start_button = control(L"BUTTON", L"&Start", WS_TABSTOP | BS_DEFPUSHBUTTON, start_id, 436, 160, 110, 28);
-        stop_button = control(L"BUTTON", L"S&top", WS_TABSTOP, stop_id, 562, 160, 110, 28);
-        status = control(L"STATIC", L"", 0, 0, 16, 204, 780, 48);
+        control(L"STATIC", L"WASAPI &mode", 0, 0, 310, 138, 160, 20);
+        mode = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, mode_id, 310, 162, 362, 150);
+        SendMessageW(mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Shared (native mix formats)"));
+        SendMessageW(mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Exclusive (24-bit in / 16-bit out, 48000 Hz)"));
+        SendMessageW(mode, CB_SETCURSEL, 0, 0);
+        refresh_button = control(L"BUTTON", L"&Refresh", WS_TABSTOP, refresh_id, 16, 204, 110, 28);
+        start_button = control(L"BUTTON", L"&Start", WS_TABSTOP | BS_DEFPUSHBUTTON, start_id, 142, 204, 110, 28);
+        stop_button = control(L"BUTTON", L"S&top", WS_TABSTOP, stop_id, 268, 204, 110, 28);
+        status = control(L"STATIC", L"", 0, 0, 16, 248, 780, 48);
         details = control(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP,
-            0, 16, 258, 780, 370);
+            0, 16, 302, 780, 370);
         refresh();
         if (!SetTimer(hwnd, 1, testing ? 50 : 250, nullptr)) throw std::runtime_error("SetTimer");
     }
@@ -235,6 +250,13 @@ struct Window {
             inputs = {{L"nonexistent-input", L"Synthetic input", {}, 0}};
             outputs = {{L"nonexistent-output", L"Synthetic output", {}, 0}};
             fill(input, inputs, input_selection); fill(output, outputs, output_selection);
+            require(selected_mode() == audio::ShareMode::shared && IsWindowEnabled(mode));
+            inputs[0].format_error = static_cast<std::int32_t>(0x80070057U);
+            selection_status(); require(!IsWindowEnabled(start_button));
+            SendMessageW(mode, CB_SETCURSEL, 1, 0);
+            SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(mode_id, CBN_SELCHANGE), reinterpret_cast<LPARAM>(mode));
+            require(selected_mode() == audio::ShareMode::exclusive && IsWindowEnabled(start_button));
+            inputs[0].format_error = 0;
             for (const bool capture : {true, false}) {
                 const auto combo = capture ? input : output;
                 auto& endpoints = capture ? inputs : outputs;
@@ -274,11 +296,15 @@ struct Window {
                     L" selection regression: passed (initial empty, duplicate names/reorder, repeated removal Refresh, empty-list return, ID reappearance, explicit reselection).\n");
             }
             SendMessageW(hwnd, WM_COMMAND, start_id, 0);
-            require(active && !IsWindowEnabled(input) && !IsWindowEnabled(output) && !IsWindowEnabled(preset) &&
+            require(active && !IsWindowEnabled(input) && !IsWindowEnabled(output) && !IsWindowEnabled(preset) && !IsWindowEnabled(mode) &&
                 !IsWindowEnabled(refresh_button) && !IsWindowEnabled(start_button) && IsWindowEnabled(stop_button));
             ++test_step;
         } else if (test_step == 1 && worker->snapshot().state == audio::State::failed) {
             update(); require(!active && IsWindowEnabled(start_button) && IsWindowEnabled(refresh_button));
+            require(worker->snapshot().setup.input.mode == audio::ShareMode::exclusive &&
+                worker->snapshot().setup.output.mode == audio::ShareMode::exclusive);
+            SendMessageW(mode, CB_SETCURSEL, 0, 0);
+            require(selected_mode() == audio::ShareMode::shared && IsWindowEnabled(mode));
             SendMessageW(hwnd, WM_COMMAND, start_id, 0);
             SendMessageW(hwnd, WM_COMMAND, stop_id, 0);
             SendMessageW(hwnd, WM_COMMAND, stop_id, 0);
@@ -304,6 +330,11 @@ struct Window {
                 case refresh_id: self->refresh(); break;
                 case start_id: self->start(); break;
                 case stop_id: self->stop(); break;
+                case mode_id:
+                    if (HIWORD(wp) == CBN_SELCHANGE && !self->active) {
+                        self->worker.reset(); self->selection_status();
+                    }
+                    break;
                 case input_id: case output_id:
                     if (HIWORD(wp) == CBN_SELCHANGE && !self->active) {
                         auto& remembered = LOWORD(wp) == input_id ? self->input_selection : self->output_selection;
@@ -321,12 +352,12 @@ struct Window {
                     const int width = std::max(680, static_cast<int>(LOWORD(lp)) - 32);
                     MoveWindow(self->input, 16, 40, width, 240, TRUE);
                     MoveWindow(self->output, 16, 100, width, 240, TRUE);
-                    MoveWindow(self->status, 16, 204, width, 48, TRUE);
-                    MoveWindow(self->details, 16, 258, width, std::max(80, static_cast<int>(HIWORD(lp)) - 274), TRUE);
+                    MoveWindow(self->status, 16, 248, width, 48, TRUE);
+                    MoveWindow(self->details, 16, 302, width, std::max(80, static_cast<int>(HIWORD(lp)) - 318), TRUE);
                 }
                 return 0;
             case WM_GETMINMAXINFO:
-                reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {740, 450}; return 0;
+                reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {740, 494}; return 0;
             case WM_QUERYENDSESSION: self->stop(); return TRUE;
             case WM_CLOSE: self->stop(); DestroyWindow(window); return 0;
             case WM_DESTROY:
@@ -357,10 +388,10 @@ int gui(HINSTANCE instance, int show, bool testing) {
     WNDCLASSW type{};
     type.lpfnWndProc = Window::procedure; type.hInstance = instance;
     type.hCursor = LoadCursorW(nullptr, IDC_ARROW); type.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    type.lpszClassName = L"AudioRepeaterSharedWindow";
+    type.lpszClassName = L"AudioRepeaterWasapiWindow";
     if (!RegisterClassW(&type)) return 3;
-    const auto window = CreateWindowExW(WS_EX_CONTROLPARENT, type.lpszClassName, L"Audio Repeater WASAPI Shared",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 860, 720, nullptr, nullptr, instance, &app);
+    const auto window = CreateWindowExW(WS_EX_CONTROLPARENT, type.lpszClassName, L"Audio Repeater WASAPI",
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 860, 764, nullptr, nullptr, instance, &app);
     if (!window) return 3;
     ShowWindow(window, show);
     MSG message{};
@@ -398,7 +429,7 @@ int run(int argc, wchar_t** argv) {
     if (mode != L"--probe") return usage();
     audio::Settings settings;
     unsigned duration = 1000;
-    bool input = false, output = false, timing = false, preset = false;
+    bool input = false, output = false, timing = false, preset = false, sharing = false;
     for (int i = 2; i < argc; i += 2) {
         if (i + 1 >= argc) return usage();
         const std::wstring_view key(argv[i]), value(argv[i + 1]);
@@ -414,6 +445,10 @@ int run(int argc, wchar_t** argv) {
             preset = true;
             if (value == L"stable") settings.preset = audio::Preset::stable;
             else if (value != L"low-latency") return usage();
+        } else if (key == L"--mode" && !sharing) {
+            sharing = true;
+            if (value == L"exclusive") settings.mode = audio::ShareMode::exclusive;
+            else if (value != L"shared") return usage();
         } else return usage();
     }
     if (!input || !output) return usage();

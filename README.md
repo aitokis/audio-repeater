@@ -1,7 +1,7 @@
-# Audio Repeater WASAPI Shared
+# Audio Repeater WASAPI
 
 An independent Windows 10/11 x64 application that transfers one capture endpoint
-to one render endpoint using WASAPI Shared. It has a native single-window interface,
+to one render endpoint using WASAPI Shared or Exclusive. It has a native single-window interface,
 a bounded audio transport, and finite command-line diagnostics.
 
 Real-device audio operation, end-to-end latency, and any latency difference versus
@@ -24,17 +24,20 @@ Double-click `audio-repeater.exe` to open the GUI:
 
 1. Select an input (capture) and output (render) endpoint. The details box shows
    their endpoint IDs; selections survive Refresh by ID, including duplicate names.
-2. Choose **Low latency** (minimum legal period) or **Stable** (default period and
+2. Choose **Shared** (the default, native mix formats) or **Exclusive** (48000 Hz,
+   24-bit capture to 16-bit render). Exclusive probes stereo, then mono, independently
+   for each endpoint. It can prevent other applications from using those devices.
+3. Choose **Low latency** (minimum legal period) or **Stable** (default period and
    larger queue), then **Start**. These are design settings, not latency guarantees.
-3. Use **Stop** before changing settings. Closing the window stops and joins the
+4. Use **Stop** before changing settings. Closing the window stops and joins the
    worker before destroying it. The settings stay disabled during startup/routing.
-4. After a device error, use **Refresh**, reselect endpoints, then **Start**. A missing
+5. After a device error, use **Refresh**, reselect endpoints, then **Start**. A missing
    selection is not silently switched to another device, even after repeated Refresh
    or an empty list. Its ID is restored if it returns; selecting another endpoint
    explicitly replaces it. Empty device lists explain the problem, disable Start,
    and leave Refresh available.
 
-Status and details update four times per second. They show actual native formats,
+Status and details update four times per second. They show the selected mode and negotiated formats,
 requested/supported/current periods, buffer frames, fallback HRESULT, MMCSS,
 FIFO/SRC queue time, drift correction, underflow/overflow/discontinuity/timestamp
 errors, resyncs, discarded frames and startup silence. Queue time includes SRC
@@ -46,7 +49,7 @@ audibility, real-device routing/removal and long-running real-device behavior
 remain unverified. Hosted native-window tests are automated message/control tests,
 not evidence of a person operating a Windows desktop. Physical end-to-end latency
 and the difference from MME remain unverified. This project does not implement MME,
-exclusive mode, ASIO, kernel streaming, render-loopback capture, a driver, a tray
+ASIO, kernel streaming, render-loopback capture, a driver, a tray
 application, or compatibility with the original application's command line.
 
 ## Build
@@ -86,6 +89,7 @@ uses the static C/C++ runtime. No external audio DLL or libsndfile is needed.
 build/Release/audio-repeater.exe --self-test
 build/Release/audio-repeater.exe --list-devices
 build/Release/audio-repeater.exe --probe --input-id "CAPTURE_ENDPOINT_ID" --output-id "RENDER_ENDPOINT_ID" --duration-ms 1000 --preset low-latency
+build/Release/audio-repeater.exe --probe --input-id "CAPTURE_ENDPOINT_ID" --output-id "RENDER_ENDPOINT_ID" --mode exclusive --duration-ms 1000 --preset low-latency
 ```
 
 Use IDs from `--list-devices`, which reports active capture and render endpoints,
@@ -96,7 +100,7 @@ joins the worker. Invalid arguments return 2, API errors return 3, and an incomp
 startup returns 4. It never changes endpoints automatically or retries indefinitely.
 After invalidation, enumerate again and choose endpoints before restarting.
 
-The low-latency preset requests the smallest legal IAudioClient3 period; `stable`
+In shared mode (`--mode shared`, the default), the low-latency preset requests the smallest legal IAudioClient3 period; `stable`
 requests its reported default. Requests must be fundamental-period multiples in
 range. If negotiation or initialization fails, a fresh client attempts ordinary
 shared/event initialization once. Diagnostics distinguish the requested period,
@@ -105,12 +109,36 @@ device period, API stream latency, and fallback HRESULT. These values are not
 measured end-to-end latency. Native mix formats are used without automatic system
 format conversion. Only the formats and channel layouts described below are accepted.
 
+Exclusive mode always requests 48000 Hz in both directions. Capture probes stereo
+packed PCM24 (EXTENSIBLE, then basic PCM), then stereo PCM32 with 24 valid bits;
+the same candidates follow in mono. Render probes stereo PCM16 (EXTENSIBLE, then
+basic PCM), then mono PCM16. Only an exact `IsFormatSupported` success accepts a
+candidate; the shared mix format is not used as evidence of exclusive support.
+If none is supported, startup fails with `AUDCLNT_E_UNSUPPORTED_FORMAT`. Device-in-use,
+exclusive-mode-disabled, invalidation and other API failures retain their HRESULT.
+There is no automatic shared-mode fallback. Stop and explicitly choose Shared if needed.
+
+Exclusive event initialization requests the endpoint's minimum device period for
+`low-latency` or its default period for `stable`, with equal buffer duration and
+periodicity. An alignment error permits one retry using the returned aligned frame
+count on a fresh client. Diagnostics include minimum/requested periods and whether
+that retry occurred. Exclusive initialization does not use IAudioClient3 shared periods.
+
 One worker owns COM and both streams. It drains at most eight capture packets per
-wake with cancellation checks, pre-fills before starting render, and only writes
-within `buffer_frames - padding`. Silent capture packets are never dereferenced.
+shared capture wake with cancellation checks. Exclusive capture reads one complete
+packet per capture event without `GetNextPacketSize`. Render pre-fills before Start;
+subsequent writes occur only on render events. Shared writes stay within
+`buffer_frames - padding`; exclusive writes use exactly the full endpoint buffer
+without a padding query. Each direction has its own event timeout. Silent capture packets are never dereferenced.
+For running exclusive streams, an unavailable endpoint buffer (`AUDCLNT_E_BUFFER_ERROR`)
+defers processing until the next event, without consuming transport samples or
+releasing an unacquired buffer. Each direction permits three consecutive errors;
+the fourth stops with that HRESULT. Successful acquisition clears that direction's
+streak. Initial render prefill and shared-mode failures stop immediately.
 Capture discontinuities reset the transport; timestamp errors have separate counters.
-The initial target uses the larger endpoint period (twice that for `stable`), with a
-safety floor of one maximum render request plus SRC lookahead. The fixed capacity
+The initial target is at least 12 ms of input (576 frames at 48 kHz). It also covers
+the larger endpoint period (twice that for `stable`) and one maximum render request
+plus SRC lookahead, retaining whichever requirement is largest. The fixed capacity
 includes at least four targets and capture-packet headroom. Buffers over half a
 second and transport capacities over two input seconds are rejected at startup.
 This conservative floor can exceed the requested period. MMCSS registration status,
@@ -118,11 +146,16 @@ queue including SRC, recovery counters, and startup silence are reported separat
 
 CTest smoke commands each have a ten-second limit and capture redirected output
 from the GUI-subsystem executable. Windows Actions also invokes the application's
-self-test directly. `audio-repeater.exe --gui-self-test` creates the actual native
+self-test directly. Fake-client checks exercise exclusive probe ordering, rejection
+of nonexact support, period bounds, fresh-client alignment retry and its finite failure
+paths, and full-buffer rendering without padding. Direction-specific fake events
+verify dispatch and timeout when only one endpoint signals. Windows CLI checks cover
+default/shared/exclusive selection, invalid modes and duplicate options.
+`audio-repeater.exe --gui-self-test` creates the actual native
 window and drives its message loop. It reports native endpoint counts, then uses
 synthetic empty lists/IDs to check empty-state controls, ID-based selection after
 reordering/removal, settings locks, a real invalid-endpoint startup failure,
-restart, repeated Stop, and close during startup with join. It requires window
+restart, repeated Stop, mode selection/locking and close during startup with join. It requires window
 creation but no human interaction or audio hardware. It does not claim routing.
 Fake sessions exercise failed startup, restart after failure,
 repeated stop, close while running, cancellation during initialization, invalidation,
@@ -139,7 +172,9 @@ log, perform I/O, or access devices.
   24 or 32 valid bits. Valid24 in PCM32 is left aligned; unused low bits are ignored.
   Rates are 8–192 kHz. Mono/stereo use unspecified masks or front-center / front-left
   and front-right masks. Other masks, channels, alignments and valid bits are rejected.
-  The Windows adapter also validates the native mix format structure and byte rate.
+  The Windows adapter also validates format structures and byte rates. Requested
+  PCM24/48000 Hz to PCM16/48000 Hz conversion is checked for packed and padded capture,
+  signed halfway rounding and saturation.
 - Mono to stereo duplicates; stereo to mono averages left and right. Nonfinite
   samples become zero. Integer encoding rounds to nearest (ties away from zero)
   and saturates. Float values retain finite headroom; nonfinite SRC output becomes
@@ -147,7 +182,9 @@ log, perform I/O, or access devices.
 - The fixed FIFO returns actual partial frame counts. `Transport` treats exceeding
   its combined FIFO/SRC capacity as an overflow, counts dropped frames, resets the
   SRC/controller, and starts prefill again. Discontinuity performs the same reset
-  and has its own counter. Steady underflow zero fills and explicitly resynchronizes.
+  and has its own counter. Steady underflow keeps the generated output prefix and
+  zero pads only its missing tail, preserving queued audio, SRC history, priming
+  and drift-controller state. SRC errors still reset the transport.
   Startup silence is counted separately. Invalid processing extents return failure.
 - SRC uses persistent `src_process`, actual input/output counts and live
   `end_of_input=0`. It feeds only output demand plus fixed lookahead. Queue size is
@@ -158,8 +195,9 @@ log, perform I/O, or access devices.
   Updates occur at most 10 Hz, with a 1-second exponential error filter, PI feedback,
   conditional antiwindup, a 200 ppm/second slew limit, and ±2000 ppm input-clock
   correction bounds. Ratio is `nominal_ratio / (1 + correction_ppm / 1e6)`.
-  Reset clears controller history. Recovery outside that range can cause silence
-  or discarded frames and is counted explicitly.
+  The controller remains active when nominal input/output rates match. Discontinuity,
+  overflow or SRC-error recovery clears controller history; ordinary underflow does
+  not. Clocks outside the correction range can cause counted silence or overflow.
 
 `Transport` requires a target larger than one maximum output request converted to
 input frames plus SRC lookahead, and capacity at least four times the target.
@@ -184,8 +222,12 @@ These are specific signal checks, not proof of full-band transparency.
 Six actual SRC transport simulations run ±100/500/2000 ppm for 30 minutes of virtual
 time at 8 kHz, using irregular capture chunks and 10 ms render requests. After a
 30-second warm-up they require zero underflow, overflow and resync, bounded queue,
-and no sustained queue growth. Out-of-range clocks and discontinuities must trigger
-explicit recovery. C and C++ allocation hooks cover core and vendor processing,
+and no sustained queue growth. Two more five-minute runs use equal nominal 48 kHz
+rates, 144-frame requests, a 576-frame target and ±500 ppm, checking correction sign
+and convergence. Repeated partial/full underruns check zero tails, retained audio
+against a persistent SRC, sub-target resumption and continuing controller updates.
+Out-of-range slow capture pads shortages; overflow and discontinuities still reset.
+C and C++ allocation hooks cover core and vendor processing,
 ratio changes and resets after warm-up. Actual compiled reverse-feedback and
 capacity-guard mutations must fail tests that also pass on the unmodified core.
 

@@ -1,5 +1,7 @@
 #include "engine_runtime.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 
 namespace audio {
@@ -10,6 +12,12 @@ std::uint32_t select_period(Periods p, Preset preset) noexcept {
     if (preset == Preset::stable && rounded != p.normal) return 0;
     if (rounded < p.minimum || rounded > p.maximum || rounded > std::numeric_limits<std::uint32_t>::max()) return 0;
     return static_cast<std::uint32_t>(rounded);
+}
+std::size_t select_queue_target(unsigned input_rate, std::size_t minimum_frames,
+                              double period_seconds, Preset preset) noexcept {
+    // A 12 ms floor leaves scheduling headroom even for very short device periods.
+    return std::max({minimum_frames, (std::size_t(input_rate) * 12 + 999) / 1000,
+        static_cast<std::size_t>(std::ceil(period_seconds * input_rate * (preset == Preset::stable ? 2 : 1)))});
 }
 void Worker::start() {
     stop();
@@ -54,29 +62,36 @@ void Worker::run(std::stop_token token) noexcept {
         if (result >= 0 && !token.stop_requested()) {
             stage = "start capture"; result = session->start_capture();
             bool rendered = false;
-            auto last_activity = std::chrono::steady_clock::now();
-            const auto startup = last_activity;
+            auto last_capture = std::chrono::steady_clock::now();
+            auto last_render = last_capture;
+            const auto startup = last_capture;
             while (result >= 0 && !token.stop_requested()) {
                 stage = "wait";
                 const auto wake = session->wait();
                 if (token.stop_requested() || wake == Wake::stopped) break;
                 if (wake == Wake::failed) { result = static_cast<std::int32_t>(0x80004005U); break; }
                 const auto now = std::chrono::steady_clock::now();
-                if (now - last_activity > std::chrono::seconds(2) ||
+                if (now - last_capture > std::chrono::seconds(2) ||
+                    (rendered && now - last_render > std::chrono::seconds(2)) ||
                     (!rendered && now - startup > std::chrono::seconds(2))) {
                     stage = "audio event/prefill timeout";
                     result = static_cast<std::int32_t>(0x800705B4U); break;
                 }
                 if (wake == Wake::idle) continue;
-                last_activity = now;
-                stage = "capture"; result = session->capture(token);
-                if (result < 0 || token.stop_requested()) break;
-                if (!rendered && session->ready()) {
-                    stage = "start render"; result = session->start_render();
-                    if (result < 0) break;
-                    rendered = true; state_ = State::running;
+                if (wake == Wake::capture) {
+                    last_capture = now;
+                    stage = "capture"; result = session->capture(token);
+                    if (result < 0 || token.stop_requested()) break;
+                    if (!rendered && session->ready()) {
+                        stage = "start render"; result = session->start_render();
+                        if (result < 0) break;
+                        last_render = now;
+                        rendered = true; state_ = State::running;
+                    }
+                } else if (rendered && wake == Wake::render) {
+                    last_render = now;
+                    stage = "render"; result = session->render();
                 }
-                if (rendered) { stage = "render"; result = session->render(); }
                 publish(session->metrics());
             }
         }

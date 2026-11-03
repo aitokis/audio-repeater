@@ -36,6 +36,30 @@ template<class F> void rejects(F f) {
     CHECK(threw);
 }
 void formats() {
+    // The requested 48 kHz PCM24 -> PCM16 conversion, including signed halfway
+    // cases, saturation and ignored low padding bits in valid24-in-32 capture.
+    constexpr std::array<std::int32_t,14> pcm24{-8388608,-8388607,-129,-128,-127,-1,0,1,127,128,129,8388479,8388480,8388607};
+    constexpr std::array<std::int32_t,14> pcm16{-32768,-32768,-1,-1,0,0,0,0,0,1,1,32767,32767,32767};
+    for (const auto encoding : {Encoding::pcm24, Encoding::pcm32}) {
+        Format capture{encoding,48000,1,24,encoding == Encoding::pcm24 ? 3U : 4U,4};
+        Format render{Encoding::pcm16,48000,1,16,2,4};
+        std::vector<std::byte> input_bytes(pcm24.size() * capture.block_align);
+        std::array<std::byte,pcm24.size() * 2> output_bytes{};
+        std::array<float,pcm24.size()> floats{};
+        for (std::size_t i = 0; i < pcm24.size(); ++i) {
+            auto raw = static_cast<std::uint32_t>(pcm24[i]);
+            if (encoding == Encoding::pcm32) raw = (raw << 8) | 0xA5;
+            for (unsigned b = 0; b < capture.block_align; ++b)
+                input_bytes[i * capture.block_align + b] = static_cast<std::byte>((raw >> (8*b)) & 255);
+        }
+        CHECK(audio::decode(capture,input_bytes,floats,1));
+        CHECK(audio::encode(render,floats,1,output_bytes));
+        for (std::size_t i = 0; i < pcm16.size(); ++i) {
+            const auto raw = std::to_integer<unsigned>(output_bytes[2*i]) |
+                (std::to_integer<unsigned>(output_bytes[2*i+1]) << 8);
+            CHECK(raw == (static_cast<std::uint32_t>(pcm16[i]) & 65535));
+        }
+    }
     const std::array encodings{Encoding::float32, Encoding::pcm16, Encoding::pcm24, Encoding::pcm32, Encoding::pcm32};
     const std::array bits{32U,16U,24U,24U,32U};
     const std::array<float, 11> input{-2,-1,-0.5F,0,0.5F,1,2,
@@ -258,17 +282,18 @@ void quality() {
     CHECK(alias<=-60);
 }
 
-void simulate(double ppm, unsigned seconds) {
-    constexpr unsigned rate=8000, block=80;
-    audio::Transport core(rate,rate,1,2048,400,block);
-    std::array<float,100> capture{};
-    std::array<float,block> output{};
+void simulate(double ppm, unsigned seconds, unsigned rate=8000, unsigned block=80, unsigned target=400) {
+    audio::Transport core(rate,rate,1,4*target+block+129,target,block);
+    std::vector<float> capture(block+20), output(block);
     std::mt19937 rng(seed);
     for(std::size_t i=0;i<capture.size();++i) capture[i]=static_cast<float>((int(rng()%1000)-500)/2000.0);
     double fraction=0, min_queue=1e9, max_queue=0, start_queue=0, end_queue=0;
     double late_first=0, late_second=0;
+    const double step_seconds=static_cast<double>(block)/rate;
+    const auto steps=static_cast<unsigned>(std::ceil(seconds/step_seconds));
+    const auto window=static_cast<unsigned>(std::ceil(30/step_seconds));
     audio::Statistics warm{};
-    for(unsigned step=0;step<seconds*100;++step) {
+    for(unsigned step=0;step<steps;++step) {
         fraction+=block*(1+ppm*1e-6);
         auto frames=static_cast<std::size_t>(std::floor(fraction)); fraction-=static_cast<double>(frames);
         while(frames) {
@@ -278,27 +303,28 @@ void simulate(double ppm, unsigned seconds) {
         core.render(output);
         CHECK(core.queued_input()<=static_cast<double>(core.capacity())+1e-6);
         CHECK(core.internal_input()>=-1e-4);
-        CHECK(core.internal_input()<240);
+        CHECK(core.internal_input()<block+160);
         CHECK(std::abs(core.correction_ppm())<=2000.00001);
-        if(step==2999) { warm=core.statistics(); start_queue=core.queued_input(); }
-        if(step>=3000) {
+        if(step==window-1) { warm=core.statistics(); start_queue=core.queued_input(); }
+        if(step>=window) {
             min_queue=std::min(min_queue,core.queued_input()); max_queue=std::max(max_queue,core.queued_input());
             for(float x:output) CHECK(std::isfinite(x));
         }
         end_queue=core.queued_input();
-        if(step>=seconds*100-6000 && step<seconds*100-3000) late_first+=end_queue/3000;
-        if(step>=seconds*100-3000) late_second+=end_queue/3000;
+        if(step>=steps-2*window && step<steps-window) late_first+=end_queue/window;
+        if(step>=steps-window) late_second+=end_queue/window;
     }
     const auto& stats=core.statistics();
-    std::printf("DRIFT ppm=%+.0f virtual_seconds=%u warmup=30 queue=[%.3f,%.3f] first=%.3f last=%.3f correction=%.6f under=%llu over=%llu resync=%llu consumed=%llu generated=%llu\n",
-        ppm,seconds,min_queue,max_queue,start_queue,end_queue,core.correction_ppm(),
+    std::printf("DRIFT rate=%u block=%u target=%u ppm=%+.0f virtual_seconds=%u warmup=30 queue=[%.3f,%.3f] first=%.3f last=%.3f correction=%.6f under=%llu over=%llu resync=%llu consumed=%llu generated=%llu\n",
+        rate,block,target,ppm,seconds,min_queue,max_queue,start_queue,end_queue,core.correction_ppm(),
         static_cast<unsigned long long>(stats.underflows-warm.underflows),
         static_cast<unsigned long long>(stats.overflows-warm.overflows),
         static_cast<unsigned long long>(stats.resyncs-warm.resyncs),
         static_cast<unsigned long long>(stats.consumed_frames),static_cast<unsigned long long>(stats.generated_frames));
     CHECK(stats.underflows==warm.underflows); CHECK(stats.overflows==warm.overflows); CHECK(stats.resyncs==warm.resyncs);
-    CHECK(stats.src_errors==0); CHECK(max_queue-min_queue<200);
-    CHECK(std::abs(end_queue-start_queue)<200);
+    CHECK(stats.src_errors==0); CHECK(max_queue-min_queue<rate*0.025);
+    CHECK(std::abs(end_queue-start_queue)<rate*0.025);
+    CHECK(std::abs(core.correction_ppm()-ppm)<5);
     std::printf("DRIFT late_30s_means first=%.6f last=%.6f difference=%+.6f frames\n",late_first,late_second,late_second-late_first);
     CHECK(std::abs(late_second-late_first)<0.1);
     CHECK(stats.generated_frames+stats.startup_silent_frames+stats.silent_frames==stats.output_frames);
@@ -325,6 +351,81 @@ void capacity_test() {
     CHECK(core.push(input)); CHECK(core.render(output)==80);
     for(float x:output) CHECK(x==0); // No pre-discontinuity SRC history survives.
 }
+void underrun() {
+    // Compare interrupted output with a continuously retained SRC. Feeding
+    // sub-target packets after empty renders must resume its exact audio history.
+    constexpr unsigned rate=48000, channels=2, block=144, target=576;
+    audio::Transport core(rate,rate,channels,2577,target,block);
+    audio::Resampler reference(rate,rate,channels);
+    std::array<float,target*channels> input{};
+    for(std::size_t i=0;i<input.size();++i)
+        input[i]=static_cast<float>(0.2*std::sin(double(i)*0.031)+0.1);
+    std::array<float,block*channels> output{}, expected{};
+    CHECK(core.push(input));
+    auto pending=std::span<const float>(input);
+    std::size_t partial=0, empty=0;
+    const auto render = [&] {
+        expected.fill(0);
+        std::size_t generated=0;
+        while(generated<block) {
+            const auto r=reference.process(pending,std::span(expected).subspan(generated*channels),1);
+            CHECK(r.error==0);
+            pending=pending.subspan(r.consumed*channels);
+            generated+=r.generated;
+            if(!r.consumed && !r.generated) break;
+        }
+        output.fill(99);
+        CHECK(core.render(output)==generated);
+        for(std::size_t i=0;i<generated*channels;++i) CHECK(std::abs(output[i]-expected[i])<2e-6F);
+        for(std::size_t i=generated*channels;i<output.size();++i) CHECK(output[i]==0);
+        if(generated<block) {
+            partial+=generated!=0; empty+=generated==0;
+            CHECK(core.statistics().resyncs==0);
+            CHECK(core.statistics().dropped_frames==0);
+            CHECK(core.internal_input()>0); // Filter history survives empty renders.
+        }
+        CHECK(core.statistics().startup_silent_frames==0);
+        CHECK(core.correction_ppm()==0); // This short trace ends before 100 ms.
+    };
+    for(int i=0;i<8;++i) render();
+    for(int cycle=0;cycle<4;++cycle) {
+        CHECK(pending.empty());
+        pending=std::span<const float>(input).first(block*channels);
+        CHECK(core.push(pending)); // 144 frames is below the 576-frame startup target.
+        render(); render();
+    }
+    CHECK(partial>0); CHECK(empty>1);
+    const auto& stats=core.statistics();
+    CHECK(stats.underflows==partial+empty);
+    CHECK(stats.overflows==0); CHECK(stats.src_errors==0);
+    CHECK(stats.generated_frames+stats.silent_frames==stats.output_frames);
+    std::printf("UNDERRUN partial=%zu empty=%zu resync=%llu dropped=%llu retained=%.3f\n",
+        partial,empty,static_cast<unsigned long long>(stats.resyncs),
+        static_cast<unsigned long long>(stats.dropped_frames),core.internal_input());
+
+    // Frequent shortages must not starve the controller's 100 ms update window.
+    audio::Transport starved(rate,rate,channels,2577,target,block);
+    CHECK(starved.push(input));
+    for(int i=0;i<100;++i) {
+        starved.render(output);
+        CHECK(std::isfinite(starved.correction_ppm()));
+        CHECK(std::abs(starved.correction_ppm())<=2000);
+    }
+    CHECK(starved.correction_ppm()<0);
+    const auto correction=starved.correction_ppm();
+    const auto underflows=starved.statistics().underflows;
+    for(int i=0;i<10;++i) starved.render(output);
+    CHECK(starved.correction_ppm()<correction); // Another update, without a reset.
+    CHECK(starved.statistics().underflows==underflows+10);
+    CHECK(starved.statistics().startup_silent_frames==0);
+    CHECK(starved.statistics().resyncs==0); CHECK(starved.statistics().dropped_frames==0);
+    CHECK(starved.push(std::span(input).first(block*channels)));
+    CHECK(starved.render(output)>0);
+    CHECK(starved.correction_ppm()<0);
+    std::printf("UNDERRUN controller correction=%.6f under=%llu resync=%llu\n",
+        starved.correction_ppm(),static_cast<unsigned long long>(starved.statistics().underflows),
+        static_cast<unsigned long long>(starved.statistics().resyncs));
+}
 void drift() {
     audio::DriftController c;
     CHECK(c.update(0.06,0.05,0.01)==0);
@@ -338,16 +439,21 @@ void drift() {
     for(int i=0;i<500;++i) c.update(0,0.05,0.1);
     CHECK(c.ppm()<0); // Antiwindup permits leaving saturation.
     for(double ppm:std::array{-2000.0,-500.0,-100.0,100.0,500.0,2000.0}) simulate(ppm,1800);
+    // Same nominal 48 kHz rates still have independent clocks. Exercise the
+    // exclusive 144-frame event size and 12 ms queue in both clock directions.
+    for(double ppm:std::array{-500.0,500.0}) simulate(ppm,300,48000,144,576);
     capacity_test();
     rejects([]{audio::Transport c(8000,8000,1,100,50,80);});
-    // Beyond correction range, repeated 10ms capture/render produces explicit recovery.
+    // Beyond correction range, a slow capture pads shortages without resets;
+    // a fast capture still invokes overflow recovery.
     for(double skew:std::array{-0.05,0.05}) {
         audio::Transport core(8000,8000,1,2048,400,80);
         std::array<float,84> input{}; std::array<float,80> output{};
         for(int i=0;i<20000;++i) {
             core.push(std::span(input).first(skew<0?76:84)); core.render(output);
         }
-        CHECK(core.statistics().resyncs>0);
+        CHECK(skew<0 ? core.statistics().resyncs==0 : core.statistics().resyncs>0);
+        if(skew<0) CHECK(core.statistics().dropped_frames==0);
         CHECK(skew<0 ? core.statistics().underflows>0 : core.statistics().overflows>0);
         std::printf("RECOVERY skew=%g under=%llu over=%llu resync=%llu\n",skew,
             static_cast<unsigned long long>(core.statistics().underflows),
@@ -396,6 +502,7 @@ int main(int argc,char** argv) {
         else if(suite=="src") src_tests();
         else if(suite=="quality") quality();
         else if(suite=="drift") drift();
+        else if(suite=="underrun") underrun();
         else if(suite=="allocation") allocation();
         else if(suite=="mutation-sign") simulate(2000,180);
         else if(suite=="mutation-capacity") capacity_test();
