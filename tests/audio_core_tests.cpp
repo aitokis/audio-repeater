@@ -36,6 +36,30 @@ template<class F> void rejects(F f) {
     CHECK(threw);
 }
 void formats() {
+    // The requested 48 kHz PCM24 -> PCM16 conversion, including signed halfway
+    // cases, saturation and ignored low padding bits in valid24-in-32 capture.
+    constexpr std::array<std::int32_t,14> pcm24{-8388608,-8388607,-129,-128,-127,-1,0,1,127,128,129,8388479,8388480,8388607};
+    constexpr std::array<std::int32_t,14> pcm16{-32768,-32768,-1,-1,0,0,0,0,0,1,1,32767,32767,32767};
+    for (const auto encoding : {Encoding::pcm24, Encoding::pcm32}) {
+        Format capture{encoding,48000,1,24,encoding == Encoding::pcm24 ? 3U : 4U,4};
+        Format render{Encoding::pcm16,48000,1,16,2,4};
+        std::vector<std::byte> input_bytes(pcm24.size() * capture.block_align);
+        std::array<std::byte,pcm24.size() * 2> output_bytes{};
+        std::array<float,pcm24.size()> floats{};
+        for (std::size_t i = 0; i < pcm24.size(); ++i) {
+            auto raw = static_cast<std::uint32_t>(pcm24[i]);
+            if (encoding == Encoding::pcm32) raw = (raw << 8) | 0xA5;
+            for (unsigned b = 0; b < capture.block_align; ++b)
+                input_bytes[i * capture.block_align + b] = static_cast<std::byte>((raw >> (8*b)) & 255);
+        }
+        CHECK(audio::decode(capture,input_bytes,floats,1));
+        CHECK(audio::encode(render,floats,1,output_bytes));
+        for (std::size_t i = 0; i < pcm16.size(); ++i) {
+            const auto raw = std::to_integer<unsigned>(output_bytes[2*i]) |
+                (std::to_integer<unsigned>(output_bytes[2*i+1]) << 8);
+            CHECK(raw == (static_cast<std::uint32_t>(pcm16[i]) & 65535));
+        }
+    }
     const std::array encodings{Encoding::float32, Encoding::pcm16, Encoding::pcm24, Encoding::pcm32, Encoding::pcm32};
     const std::array bits{32U,16U,24U,24U,32U};
     const std::array<float, 11> input{-2,-1,-0.5F,0,0.5F,1,2,

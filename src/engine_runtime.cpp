@@ -54,29 +54,36 @@ void Worker::run(std::stop_token token) noexcept {
         if (result >= 0 && !token.stop_requested()) {
             stage = "start capture"; result = session->start_capture();
             bool rendered = false;
-            auto last_activity = std::chrono::steady_clock::now();
-            const auto startup = last_activity;
+            auto last_capture = std::chrono::steady_clock::now();
+            auto last_render = last_capture;
+            const auto startup = last_capture;
             while (result >= 0 && !token.stop_requested()) {
                 stage = "wait";
                 const auto wake = session->wait();
                 if (token.stop_requested() || wake == Wake::stopped) break;
                 if (wake == Wake::failed) { result = static_cast<std::int32_t>(0x80004005U); break; }
                 const auto now = std::chrono::steady_clock::now();
-                if (now - last_activity > std::chrono::seconds(2) ||
+                if (now - last_capture > std::chrono::seconds(2) ||
+                    (rendered && now - last_render > std::chrono::seconds(2)) ||
                     (!rendered && now - startup > std::chrono::seconds(2))) {
                     stage = "audio event/prefill timeout";
                     result = static_cast<std::int32_t>(0x800705B4U); break;
                 }
                 if (wake == Wake::idle) continue;
-                last_activity = now;
-                stage = "capture"; result = session->capture(token);
-                if (result < 0 || token.stop_requested()) break;
-                if (!rendered && session->ready()) {
-                    stage = "start render"; result = session->start_render();
-                    if (result < 0) break;
-                    rendered = true; state_ = State::running;
+                if (wake == Wake::capture) {
+                    last_capture = now;
+                    stage = "capture"; result = session->capture(token);
+                    if (result < 0 || token.stop_requested()) break;
+                    if (!rendered && session->ready()) {
+                        stage = "start render"; result = session->start_render();
+                        if (result < 0) break;
+                        last_render = now;
+                        rendered = true; state_ = State::running;
+                    }
+                } else if (rendered && wake == Wake::render) {
+                    last_render = now;
+                    stage = "render"; result = session->render();
                 }
-                if (rendered) { stage = "render"; result = session->render(); }
                 publish(session->metrics());
             }
         }

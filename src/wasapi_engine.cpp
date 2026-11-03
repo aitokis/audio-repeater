@@ -43,6 +43,7 @@ struct Stream {
     ComPtr<IAudioClient> client;
     ComPtr<IAudioClient3> client3;
     Mix mix;
+    WAVEFORMATEXTENSIBLE exclusive_wave{};
     Handle event;
     StreamInfo info;
     bool started{};
@@ -62,25 +63,43 @@ struct Stream {
         return client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                   0, 0, mix.get(), nullptr);
     }
-    void open(IMMDeviceEnumerator* devices, const std::wstring& id, EDataFlow expected, Preset preset) {
+    HRESULT supports_format(const Format& format, bool extensible) noexcept {
+        exclusive_wave = exclusive_wave_format(format, extensible);
+        return client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &exclusive_wave.Format, nullptr);
+    }
+    HRESULT device_periods(std::int64_t& normal, std::int64_t& minimum) noexcept {
+        return client->GetDevicePeriod(&normal, &minimum);
+    }
+    HRESULT initialize_exclusive(std::int64_t duration) noexcept {
+        return client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                  duration, duration, &exclusive_wave.Format, nullptr);
+    }
+    HRESULT buffer_size(std::uint32_t& frames) noexcept { return client->GetBufferSize(&frames); }
+    HRESULT padding(std::uint32_t& frames) noexcept { return client->GetCurrentPadding(&frames); }
+    void open(IMMDeviceEnumerator* devices, const std::wstring& id, EDataFlow expected, Preset preset, ShareMode mode) {
+        info.mode = mode;
         check(devices->GetDevice(id.c_str(), &device));
         ComPtr<IMMEndpoint> endpoint;
         check(device.As(&endpoint));
         EDataFlow flow{}; check(endpoint->GetDataFlow(&flow));
         if (flow != expected) throw WasapiError{E_INVALIDARG};
-        mix = mix_format(device.Get()); info.format = native_format(*mix);
-        check(initialize_shared(*this, preset, info));
+        if (mode == ShareMode::exclusive) {
+            check(audio::initialize_exclusive(*this, expected == eCapture, preset, info));
+        } else {
+            mix = mix_format(device.Get()); info.format = native_format(*mix);
+            check(initialize_shared(*this, preset, info));
+        }
         event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!event.value) throw WasapiError{HRESULT_FROM_WIN32(GetLastError())};
         check(client->SetEventHandle(event.value));
         check(client->GetBufferSize(&info.buffer_frames));
-        REFERENCE_TIME minimum = 0;
-        check(client->GetDevicePeriod(&info.default_period_100ns, &minimum));
+        check(client->GetDevicePeriod(&info.default_period_100ns, &info.minimum_period_100ns));
         check(client->GetStreamLatency(&info.latency_100ns));
         info.initialized = true;
         // GetDevicePeriod is a default, not evidence of the currently running period.
-        if (!client3) (void)client.As(&client3);
-        if (client3) {
+        if (mode == ShareMode::exclusive) info.actual_period_frames = info.buffer_frames;
+        else if (!client3) (void)client.As(&client3);
+        if (mode == ShareMode::shared && client3) {
             WAVEFORMATEX* current = nullptr;
             UINT32 frames = 0;
             const auto result = client3->GetCurrentSharedModeEnginePeriod(&current, &frames);
@@ -105,6 +124,8 @@ public:
         if (com_) CoUninitialize();
     }
     std::int32_t initialize(std::stop_token token, SetupInfo& setup) override {
+        input_.info.mode = output_.info.mode = settings_.mode;
+        setup.input = input_.info; setup.output = output_.info;
         const auto hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(hr)) return hr;
         com_ = true;
@@ -114,10 +135,10 @@ public:
             callback_.emplace(token, Signal{stop_event_.value});
             if (token.stop_requested()) return S_OK;
             auto devices = enumerator();
-            input_.open(devices.Get(), settings_.input_id, eCapture, settings_.preset);
+            input_.open(devices.Get(), settings_.input_id, eCapture, settings_.preset, settings_.mode);
             setup.input = input_.info;
             if (token.stop_requested()) return S_OK;
-            output_.open(devices.Get(), settings_.output_id, eRender, settings_.preset);
+            output_.open(devices.Get(), settings_.output_id, eRender, settings_.preset, settings_.mode);
             setup.output = output_.info;
             if (token.stop_requested()) return S_OK;
             check(input_.client->GetService(IID_PPV_ARGS(&capture_)));
@@ -161,62 +182,70 @@ public:
         const HANDLE handles[] = {stop_event_.value, input_.event.value, output_.event.value};
         const auto result = WaitForMultipleObjects(3, handles, FALSE, 100);
         if (result == WAIT_OBJECT_0) return Wake::stopped;
-        if (result == WAIT_OBJECT_0 + 1 || result == WAIT_OBJECT_0 + 2) return Wake::audio;
+        if (result == WAIT_OBJECT_0 + 1) return Wake::capture;
+        if (result == WAIT_OBJECT_0 + 2) return Wake::render;
         return result == WAIT_TIMEOUT ? Wake::idle : Wake::failed;
     }
     std::int32_t capture(std::stop_token token) noexcept override {
         // Finite drain, even when a driver continually supplies packets. Every
         // acquired packet is released on this same thread before cancellation.
-        for (unsigned packet = 0; packet < 8 && !token.stop_requested(); ++packet) {
-            UINT32 next = 0;
-            auto hr = capture_->GetNextPacketSize(&next);
-            if (FAILED(hr) || !next) return hr;
-            BYTE* data = nullptr; UINT32 frames = 0; DWORD flags = 0;
-            hr = capture_->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
-            if (FAILED(hr)) return hr;
-            if (hr == AUDCLNT_S_BUFFER_EMPTY) return S_OK;
-            const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-            if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) transport_->discontinuity();
-            if (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) ++timestamps_;
-            bool decoded = false;
-            if (frames <= input_.info.buffer_frames && (silent || data)) {
-                auto floats = std::span<float>(capture_scratch_.data(), static_cast<std::size_t>(frames) * output_.info.format.channels);
-                const auto bytes = silent ? std::span<const std::byte>{} : std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(data), static_cast<std::size_t>(frames) * input_.info.format.block_align);
-                decoded = decode(input_.info.format, bytes, floats, output_.info.format.channels, silent);
-                if (decoded) { (void)transport_->push(floats); if (silent) silent_capture_ += frames; }
+        for (unsigned packet = 0; packet < (settings_.mode == ShareMode::exclusive ? 1U : 8U) && !token.stop_requested(); ++packet) {
+            HRESULT hr = S_OK;
+            if (settings_.mode == ShareMode::shared) {
+                UINT32 next = 0;
+                hr = capture_->GetNextPacketSize(&next);
+                if (FAILED(hr) || !next) return hr;
             }
-            hr = capture_->ReleaseBuffer(frames);
+            BYTE* data = nullptr; UINT32 frames = 0; DWORD flags = 0;
+            hr = capture_pass_.run(settings_.mode, input_.started,
+                [&] { return capture_->GetBuffer(&data, &frames, &flags, nullptr, nullptr); }, [&]() -> std::int32_t {
+                    const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                    if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) transport_->discontinuity();
+                    if (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) ++timestamps_;
+                    bool decoded = false;
+                    if (frames <= input_.info.buffer_frames && (silent || data)) {
+                        auto floats = std::span<float>(capture_scratch_.data(), static_cast<std::size_t>(frames) * output_.info.format.channels);
+                        const auto bytes = silent ? std::span<const std::byte>{} : std::span<const std::byte>(
+                            reinterpret_cast<const std::byte*>(data), static_cast<std::size_t>(frames) * input_.info.format.block_align);
+                        decoded = decode(input_.info.format, bytes, floats, output_.info.format.channels, silent);
+                        if (decoded) { (void)transport_->push(floats); if (silent) silent_capture_ += frames; }
+                    }
+                    const auto release = capture_->ReleaseBuffer(frames);
+                    if (FAILED(release)) return release;
+                    return decoded ? S_OK : E_INVALIDARG;
+                });
             if (FAILED(hr)) return hr;
-            if (!decoded) return E_INVALIDARG;
+            if (hr != S_OK) return S_OK; // empty/deferred: wait for another event
         }
         return S_OK;
     }
     bool ready() const noexcept override { return transport_->queued_input() >= static_cast<double>(target_); }
     std::int32_t start_render() noexcept override {
+        // Discard notifications from initialization/prefill waiting; subsequent
+        // buffer requests must follow a fresh event from the running stream.
+        if (!ResetEvent(output_.event.value)) return HRESULT_FROM_WIN32(GetLastError());
         auto hr = render(); // prefill the endpoint before starting its clock
-        if (FAILED(hr)) return hr;
+        if (hr != S_OK) return FAILED(hr) ? hr : E_UNEXPECTED;
         hr = output_.client->Start(); output_.started = SUCCEEDED(hr); return hr;
     }
     std::int32_t render() noexcept override {
-        UINT32 padding = 0;
-        auto hr = output_.client->GetCurrentPadding(&padding);
+        UINT32 frames = 0;
+        auto hr = render_request(output_, settings_.mode, output_.info.buffer_frames, frames);
         if (FAILED(hr)) return hr;
-        if (padding > output_.info.buffer_frames) return E_UNEXPECTED;
-        const UINT32 frames = output_.info.buffer_frames - padding;
         if (!frames) return S_OK;
-        auto floats = std::span<float>(render_scratch_.data(), static_cast<std::size_t>(frames) * output_.info.format.channels);
-        (void)transport_->render(floats);
         BYTE* data = nullptr;
-        hr = render_->GetBuffer(frames, &data);
-        if (FAILED(hr)) return hr;
-        const bool silent = std::all_of(floats.begin(), floats.end(), [](float f) { return f == 0; });
-        bool encoded = true;
-        if (!silent) encoded = encode(output_.info.format, floats, output_.info.format.channels,
-            {reinterpret_cast<std::byte*>(data), static_cast<std::size_t>(frames) * output_.info.format.block_align});
-        hr = render_->ReleaseBuffer(frames, silent || !encoded ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
-        if (FAILED(hr)) return hr;
-        return encoded ? S_OK : E_INVALIDARG;
+        return render_pass_.run(settings_.mode, output_.started,
+            [&] { return render_->GetBuffer(frames, &data); }, [&]() -> std::int32_t {
+                auto floats = std::span<float>(render_scratch_.data(), static_cast<std::size_t>(frames) * output_.info.format.channels);
+                (void)transport_->render(floats);
+                const bool silent = std::all_of(floats.begin(), floats.end(), [](float f) { return f == 0; });
+                bool encoded = true;
+                if (!silent) encoded = encode(output_.info.format, floats, output_.info.format.channels,
+                    {reinterpret_cast<std::byte*>(data), static_cast<std::size_t>(frames) * output_.info.format.block_align});
+                const auto release = render_->ReleaseBuffer(frames, silent || !encoded ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+                if (FAILED(release)) return release;
+                return encoded ? S_OK : E_INVALIDARG;
+            });
     }
     Metrics metrics() const noexcept override {
         return transport_ ? Metrics{transport_->statistics(), timestamps_, silent_capture_,
@@ -240,7 +269,24 @@ private:
     std::vector<float> capture_scratch_, render_scratch_;
     std::size_t target_{};
     std::uint64_t timestamps_{}, silent_capture_{};
+    BufferPass capture_pass_, render_pass_;
 };
+}
+WAVEFORMATEXTENSIBLE exclusive_wave_format(const Format& format, bool extensible) noexcept {
+    WAVEFORMATEXTENSIBLE wave{};
+    wave.Format.wFormatTag = extensible ? WAVE_FORMAT_EXTENSIBLE : WAVE_FORMAT_PCM;
+    wave.Format.nChannels = static_cast<WORD>(format.channels);
+    wave.Format.nSamplesPerSec = format.rate;
+    wave.Format.wBitsPerSample = static_cast<WORD>(format.bytes_per_sample() * 8);
+    wave.Format.nBlockAlign = static_cast<WORD>(format.block_align);
+    wave.Format.nAvgBytesPerSec = format.rate * format.block_align;
+    if (extensible) {
+        wave.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+        wave.Samples.wValidBitsPerSample = static_cast<WORD>(format.valid_bits);
+        wave.dwChannelMask = format.channel_mask;
+        wave.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    }
+    return wave;
 }
 Format native_format(const WAVEFORMATEX& wave) {
     bool is_float = wave.wFormatTag == WAVE_FORMAT_IEEE_FLOAT;

@@ -50,7 +50,7 @@ if(BUILD_TESTING)
   set_tests_properties(engine_lifecycle PROPERTIES TIMEOUT 10)
   if(WIN32)
     target_sources(audio-repeater PRIVATE tests/allocator_hooks.cpp)
-    foreach(mode self-test gui-self-test list-devices invalid missing-endpoints invalid-endpoints invalid-duration oversized-duration duplicate-id invalid-preset)
+    foreach(mode self-test gui-self-test list-devices invalid missing-endpoints invalid-endpoints shared-endpoints exclusive-endpoints invalid-duration oversized-duration duplicate-id invalid-preset invalid-mode duplicate-mode)
       add_test(NAME smoke_${mode} COMMAND ${CMAKE_COMMAND}
         "-DPROGRAM=$<TARGET_FILE:audio-repeater>" "-DMODE=${mode}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_smoke.cmake")
