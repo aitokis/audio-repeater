@@ -228,7 +228,8 @@ public:
     std::int32_t start_render() noexcept override {
         own(); if (wake_ != Wake::capture) audit_.wrong_dispatch = true;
         if (audit_.mode == Mode::prefill_unavailable)
-            return render_pass_.run(ShareMode::exclusive,false, [] { return buffer_error; },
+            return render_pass_.run(ShareMode::exclusive,false,
+                [&] { return audit_.mode == Mode::prefill_unavailable ? buffer_error : 0; },
                 [&] { ++audit_.rendered; return 0; });
         ++audit_.render_started; return audit_.mode == Mode::render_start_failure ? failure : 0;
     }

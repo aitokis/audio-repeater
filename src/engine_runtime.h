@@ -129,9 +129,9 @@ std::int32_t initialize_shared(Client& client, Preset preset, StreamInfo& info) 
 // also tried for packed samples because some drivers reject EXTENSIBLE layouts.
 template<class Client>
 std::int32_t initialize_exclusive(Client& client, bool capture, Preset preset, StreamInfo& info) {
-    constexpr auto invalid = static_cast<std::int32_t>(0x80070057U);
-    constexpr auto unsupported = static_cast<std::int32_t>(0x88890008U);
-    constexpr auto unaligned = static_cast<std::int32_t>(0x88890019U);
+    constexpr auto exclusive_invalid_argument = static_cast<std::int32_t>(0x80070057U);
+    constexpr auto exclusive_unsupported_format = static_cast<std::int32_t>(0x88890008U);
+    constexpr auto exclusive_buffer_not_aligned = static_cast<std::int32_t>(0x88890019U);
     info.mode = ShareMode::exclusive;
     auto result = client.activate();
     if (result < 0) return result;
@@ -143,27 +143,27 @@ std::int32_t initialize_exclusive(Client& client, bool capture, Preset preset, S
             f.block_align = f.bytes_per_sample() * channels;
             result = client.supports_format(f, variant != 1);
             if (result == 0) { info.format = f; found = true; break; }
-            if (result < 0 && result != unsupported && result != invalid) return result;
+            if (result < 0 && result != exclusive_unsupported_format && result != exclusive_invalid_argument) return result;
         }
         if (found) break;
     }
-    if (!found) return unsupported;
+    if (!found) return exclusive_unsupported_format;
     result = client.device_periods(info.default_period_100ns, info.minimum_period_100ns);
     if (result < 0) return result;
     if (info.minimum_period_100ns <= 0 || info.default_period_100ns < info.minimum_period_100ns ||
-        info.default_period_100ns > 5'000'000) return invalid;
+        info.default_period_100ns > 5'000'000) return exclusive_invalid_argument;
     info.requested_period_100ns = preset == Preset::stable ? info.default_period_100ns : info.minimum_period_100ns;
     info.requested_frames = static_cast<std::uint32_t>((info.requested_period_100ns * 48000 + 5'000'000) / 10'000'000);
     result = client.initialize_exclusive(info.requested_period_100ns);
-    if (result != unaligned) return result;
+    if (result != exclusive_buffer_not_aligned) return result;
     // GetBufferSize after NOT_ALIGNED provides the driver's required frame count.
     // Only one retry is allowed, on a newly activated client.
     std::uint32_t frames = 0;
     result = client.buffer_size(frames);
     if (result < 0) return result;
-    if (!frames || frames > 24000) return invalid;
+    if (!frames || frames > 24000) return exclusive_invalid_argument;
     const auto duration = (std::int64_t(frames) * 10'000'000 + 24000) / 48000;
-    if (duration < info.minimum_period_100ns) return invalid;
+    if (duration < info.minimum_period_100ns) return exclusive_invalid_argument;
     info.alignment_retry = true;
     info.requested_frames = frames; info.requested_period_100ns = duration;
     client.release();
