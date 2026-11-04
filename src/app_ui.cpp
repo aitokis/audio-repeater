@@ -1,5 +1,6 @@
 #include "desktop_host.h"
 #include "wasapi_engine.h"
+#include <objbase.h>
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
