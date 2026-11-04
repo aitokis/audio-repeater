@@ -1,7 +1,7 @@
 # Audio Repeater WASAPI
 
 An independent Windows 10/11 x64 application that transfers one capture endpoint
-to one render endpoint using WASAPI Shared or Exclusive. It has a native single-window interface,
+to one render endpoint using WASAPI Shared or Exclusive. It has native tray settings, per-user sign-in startup, quiet device reconnection,
 a bounded audio transport, and finite command-line diagnostics.
 
 Real-device audio operation, end-to-end latency, and any latency difference versus
@@ -20,22 +20,55 @@ against the run and use `Get-FileHash -Algorithm SHA256` to compare files with
 Artifacts expire after 30 days; these builds are unsigned and are not GitHub Releases.
 No installer, external audio DLL, or Visual C++ runtime installation is required.
 
-Double-click `audio-repeater.exe` to open the GUI:
+Double-click `audio-repeater.exe`. The first launch opens settings:
 
-1. Select an input (capture) and output (render) endpoint. The details box shows
-   their endpoint IDs; selections survive Refresh by ID, including duplicate names.
+1. Select input (capture) and output (render) endpoints. Selections are stored by
+   endpoint ID, including devices with duplicate names.
 2. Choose **Shared** (the default, native mix formats) or **Exclusive** (48000 Hz,
    24-bit capture to 16-bit render). Exclusive probes stereo, then mono, independently
    for each endpoint. It can prevent other applications from using those devices.
 3. Choose **Low latency** (minimum legal period) or **Stable** (default period and
    larger queue), then **Start**. These are design settings, not latency guarantees.
-4. Use **Stop** before changing settings. Closing the window stops and joins the
-   worker before destroying it. The settings stay disabled during startup/routing.
-5. After a device error, use **Refresh**, reselect endpoints, then **Start**. A missing
-   selection is not silently switched to another device, even after repeated Refresh
-   or an empty list. Its ID is restored if it returns; selecting another endpoint
-   explicitly replaces it. Empty device lists explain the problem, disable Start,
-   and leave Refresh available.
+4. To launch automatically after Windows sign-in, check **Launch at Windows sign-in**.
+   Check **Resume audio on launch** to restart the saved route too, then **Save settings**.
+   Both options are off initially. Start also saves current settings. Stop before
+   changing settings. Configured later launches normally stay in the tray.
+5. Closing or minimizing hides settings and keeps audio running. Click the tray icon
+   or choose **Settings** in its menu to reopen them. Double-clicking the executable
+   again opens the existing settings window; it does not create another audio worker.
+   The tray menu also offers **Start / resume**, **Stop**, and **Exit**.
+6. Device removal and startup/audio errors do not open dialogs, show notifications,
+   or bring settings to the foreground. The application waits for the saved endpoint
+   IDs and immediately retries when Windows reports a device change. If a driver or
+   audio service is not ready, it retries after 1, 2, 4, 8, 16, then at most 30 seconds.
+   Device notifications bypass that delay. A failed notification subscription retries
+   quietly every two seconds and rescans when restored. Actual recovery still needs both devices
+   and their requested formats to become usable. The application never silently
+   substitutes another endpoint or switches Exclusive to Shared. **Stop** cancels
+   reconnect retries until **Start**; **Exit** stops and joins the worker and exits.
+
+The tray icon is recreated after Explorer restarts. If Windows cannot create the
+icon, settings remain visible and tray registration is retried. Windows may put
+an icon in its overflow area; expand that area or pin it in Windows taskbar settings.
+
+### Stored files and removal
+
+No installer, administrator access, service, driver, startup registry entry, or
+external runtime is used. Settings occupy only
+`%LOCALAPPDATA%\AudioRepeaterWasapi\settings.conf` (plus a temporary file while saving).
+Enabling sign-in launch creates only `AudioRepeaterWasapi.lnk` in the current user's
+Startup folder (`Win+R`, `shell:startup`). It targets this executable with
+`--background`. Moving the extracted application requires enabling sign-in launch
+and saving again from the new location. Foreign shortcuts with that filename are
+not overwritten or removed; rename or remove the conflicting shortcut yourself.
+
+Choose **Remove startup and saved settings, then exit** from the tray menu, then
+remove the extracted application directory. Cleanup removes only this application's
+shortcut and settings files; it does not recursively delete other files. If doing
+this manually, choose **Exit**, delete the Startup shortcut and the settings file,
+then delete the extracted application. Unchecking **Launch at Windows sign-in** and
+saving disables automatic launch without deleting settings. Windows itself can also
+disable a Startup entry, independently of the shortcut's presence.
 
 Status and details update four times per second. They show the selected mode and negotiated formats,
 requested/supported/current periods, buffer frames, fallback HRESULT, MMCSS,
@@ -49,8 +82,7 @@ audibility, real-device routing/removal and long-running real-device behavior
 remain unverified. Hosted native-window tests are automated message/control tests,
 not evidence of a person operating a Windows desktop. Physical end-to-end latency
 and the difference from MME remain unverified. This project does not implement MME,
-ASIO, kernel streaming, render-loopback capture, a driver, a tray
-application, or compatibility with the original application's command line.
+ASIO, kernel streaming, render-loopback capture, a driver, or compatibility with the original application's command line.
 
 ## Build
 
@@ -145,7 +177,8 @@ This conservative floor can exceed the requested period. MMCSS registration stat
 queue including SRC, recovery counters, and startup silence are reported separately.
 
 CTest smoke commands each have a ten-second limit and capture redirected output
-from the GUI-subsystem executable. Windows Actions also invokes the application's
+from the GUI-subsystem executable. Portable desktop-policy tests check strict settings
+round trips, malformed/Unicode IDs, retry bounds and Stop cancellation. Windows Actions also invokes the application's
 self-test directly. Fake-client checks exercise exclusive probe ordering, rejection
 of nonexact support, period bounds, fresh-client alignment retry and its finite failure
 paths, and full-buffer rendering without padding. Direction-specific fake events
@@ -155,7 +188,21 @@ default/shared/exclusive selection, invalid modes and duplicate options.
 window and drives its message loop. It reports native endpoint counts, then uses
 synthetic empty lists/IDs to check empty-state controls, ID-based selection after
 reordering/removal, settings locks, a real invalid-endpoint startup failure,
-restart, repeated Stop, mode selection/locking and close during startup with join. It requires window
+restart, repeated Stop, mode selection/locking, tray hide/show and Explorer recreation
+messages, saved-ID waiting/cancellation, and explicit Exit during startup with join.
+It also checks settings and Startup shortcut creation/removal/relocation/foreign
+shortcut preservation in a unique temporary directory, never in the user profile.
+Native launch cases load disposable missing, corrupt and valid settings through the
+production initialization, restore mode/preset/IDs/resume, check configured visibility
+with available/unavailable tray status, and exit during synthetic startup and running.
+Two child processes use a GUID-isolated instance/window identity to exercise the same
+mutex and foreground/background forwarding branch without creating an audio worker.
+A failed notification subscription followed by success checks the timer retry path.
+The minimum window size is checked against the actual Exit control bounds.
+A synthetic Session and endpoint
+lists drive the same worker and notification-message handlers to check successful
+reconnect with unchanged IDs/mode/preset, unrelated notifications without restart,
+removal cleanup, and Stop preventing later reconnect. It requires window
 creation but no human interaction or audio hardware. It does not claim routing.
 Fake sessions exercise failed startup, restart after failure,
 repeated stop, close while running, cancellation during initialization, invalidation,
