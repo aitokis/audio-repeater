@@ -129,13 +129,15 @@ native formats, unsupported formats, and explicit empty lists. `--self-test` use
 fake sessions and requires no audio device; it does not demonstrate audible routing.
 The probe runs for 1–5000 ms (default 1000) including startup, then requests stop and
 joins the worker. Invalid arguments return 2, API errors return 3, and an incomplete
-startup returns 4. It never changes endpoints automatically or retries indefinitely.
-After invalidation, enumerate again and choose endpoints before restarting.
+startup returns 4. It never changes endpoint IDs automatically. Session invalidation
+and event timeouts trigger fresh-session retries within the probe's duration; its
+deadline still stops and joins the worker.
 
 In shared mode (`--mode shared`, the default), the low-latency preset requests the smallest legal IAudioClient3 period; `stable`
 requests its reported default. Requests must be fundamental-period multiples in
 range. If negotiation or initialization fails, a fresh client attempts ordinary
-shared/event initialization once. Diagnostics distinguish the requested period,
+shared/event initialization once, except that session invalidation rebuilds the
+whole session. Diagnostics distinguish the requested period,
 actual buffer frames, queried current engine period (or `unavailable`), default
 device period, API stream latency, and fallback HRESULT. These values are not
 measured end-to-end latency. Native mix formats are used without automatic system
@@ -147,7 +149,8 @@ the same candidates follow in mono. Render probes stereo PCM16 (EXTENSIBLE, then
 basic PCM), then mono PCM16. Only an exact `IsFormatSupported` success accepts a
 candidate; the shared mix format is not used as evidence of exclusive support.
 If none is supported, startup fails with `AUDCLNT_E_UNSUPPORTED_FORMAT`. Device-in-use,
-exclusive-mode-disabled, invalidation and other API failures retain their HRESULT.
+exclusive-mode-disabled and other API failures retain their HRESULT. Session
+invalidation rebuilds the whole session with the same exclusive settings.
 There is no automatic shared-mode fallback. Stop and explicitly choose Shared if needed.
 
 Exclusive event initialization requests the endpoint's minimum device period for
@@ -161,7 +164,13 @@ shared capture wake with cancellation checks. Exclusive capture reads one comple
 packet per capture event without `GetNextPacketSize`. Render pre-fills before Start;
 subsequent writes occur only on render events. Shared writes stay within
 `buffer_frames - padding`; exclusive writes use exactly the full endpoint buffer
-without a padding query. Each direction has its own event timeout. Silent capture packets are never dereferenced.
+without a padding query. Each direction has its own two-second event timeout;
+initial prefill has the same deadline. Either watchdog or `AUDCLNT_E_DEVICE_INVALIDATED` /
+`AUDCLNT_E_RESOURCES_INVALIDATED` immediately leaves the audio loop, stops both streams
+and releases every old client/service before creating a fresh session with the same
+IDs, mode and preset. Setup and counters reset for the new session. Retries pause
+for 100 ms and Stop/Exit cancels the pause or startup. Other failures retain the
+ordinary failed-state handling. Silent capture packets are never dereferenced.
 For running exclusive streams, an unavailable endpoint buffer (`AUDCLNT_E_BUFFER_ERROR`)
 defers processing until the next event, without consuming transport samples or
 releasing an unacquired buffer. Each direction permits three consecutive errors;
@@ -205,9 +214,10 @@ reconnect with unchanged IDs/mode/preset, unrelated notifications without restar
 removal cleanup, and Stop preventing later reconnect. It requires window
 creation but no human interaction or audio hardware. It does not claim routing.
 Fake sessions exercise failed startup, restart after failure,
-repeated stop, close while running, cancellation during initialization, invalidation,
-and absent events. Hardware routing, device removal, audible output, and long-running
-real-device behavior remain unverified.
+repeated stop, close while running, invalidation at initialization and both streams'
+start/processing calls, destruction before replacement, cancellation during retries,
+and watchdog recovery even while the other endpoint keeps signaling. Hardware routing,
+device removal, audible output, and long-running real-device behavior remain unverified.
 
 ## Core contract
 

@@ -47,6 +47,10 @@ struct Snapshot {
     const char* stage{"idle"};
 };
 enum class Wake { capture, render, idle, stopped, failed };
+constexpr bool session_invalidated(std::int32_t result) noexcept {
+    return result == static_cast<std::int32_t>(0x88890004U) || // AUDCLNT_E_DEVICE_INVALIDATED
+           result == static_cast<std::int32_t>(0x88890026U);   // AUDCLNT_E_RESOURCES_INVALIDATED
+}
 // A missing exclusive packet is recoverable only while its endpoint is running.
 // Each call is one event's single acquisition attempt; processing requires S_OK.
 class BufferPass {
@@ -121,6 +125,7 @@ std::int32_t initialize_shared(Client& client, Preset preset, StreamInfo& info) 
         else result = static_cast<std::int32_t>(0x80070057U);
     }
     if (result >= 0) { info.client3 = true; return result; }
+    if (session_invalidated(result)) return result;
     info.fallback_reason = result;
     client.release();
     result = client.activate();
