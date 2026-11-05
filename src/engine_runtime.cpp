@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <limits>
 
 namespace audio {
@@ -54,49 +55,70 @@ void Worker::run(std::stop_token token) noexcept {
     std::unique_ptr<Session> session;
     std::int32_t result = 0;
     const char* stage = "initialize";
-    try {
-        session = factory_();
-        SetupInfo setup;
-        result = session->initialize(token, setup);
-        { std::lock_guard lock(setup_mutex_); setup_ = setup; }
-        if (result >= 0 && !token.stop_requested()) {
-            stage = "start capture"; result = session->start_capture();
-            bool rendered = false;
-            auto last_capture = std::chrono::steady_clock::now();
-            auto last_render = last_capture;
-            const auto startup = last_capture;
-            while (result >= 0 && !token.stop_requested()) {
-                stage = "wait";
-                const auto wake = session->wait();
-                if (token.stop_requested() || wake == Wake::stopped) break;
-                if (wake == Wake::failed) { result = static_cast<std::int32_t>(0x80004005U); break; }
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_capture > std::chrono::seconds(2) ||
-                    (rendered && now - last_render > std::chrono::seconds(2)) ||
-                    (!rendered && now - startup > std::chrono::seconds(2))) {
-                    stage = "audio event/prefill timeout";
-                    result = static_cast<std::int32_t>(0x800705B4U); break;
-                }
-                if (wake == Wake::idle) continue;
-                if (wake == Wake::capture) {
-                    last_capture = now;
-                    stage = "capture"; result = session->capture(token);
-                    if (result < 0 || token.stop_requested()) break;
-                    if (!rendered && session->ready()) {
-                        stage = "start render"; result = session->start_render();
-                        if (result < 0) break;
-                        last_render = now;
-                        rendered = true; state_ = State::running;
+    while (!token.stop_requested()) {
+        bool timed_out = false;
+        result = 0; stage = "initialize";
+        try {
+            session = factory_();
+            SetupInfo setup;
+            result = session->initialize(token, setup);
+            { std::lock_guard lock(setup_mutex_); setup_ = setup; }
+            if (result >= 0 && !token.stop_requested()) {
+                stage = "start capture"; result = session->start_capture();
+                bool rendered = false;
+                auto last_capture = std::chrono::steady_clock::now();
+                auto last_render = last_capture;
+                const auto startup = last_capture;
+                while (result >= 0 && !token.stop_requested()) {
+                    stage = "wait";
+                    const auto wake = session->wait();
+                    if (token.stop_requested() || wake == Wake::stopped) break;
+                    if (wake == Wake::failed) { result = static_cast<std::int32_t>(0x80004005U); break; }
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last_capture > std::chrono::seconds(2) ||
+                        (rendered && now - last_render > std::chrono::seconds(2)) ||
+                        (!rendered && now - startup > std::chrono::seconds(2))) {
+                        stage = "audio event/prefill timeout";
+                        result = static_cast<std::int32_t>(0x800705B4U); timed_out = true; break;
                     }
-                } else if (rendered && wake == Wake::render) {
-                    last_render = now;
-                    stage = "render"; result = session->render();
+                    if (wake == Wake::idle) continue;
+                    if (wake == Wake::capture) {
+                        last_capture = now;
+                        stage = "capture"; result = session->capture(token);
+                        if (result < 0 || token.stop_requested()) break;
+                        if (!rendered && session->ready()) {
+                            stage = "start render"; result = session->start_render();
+                            if (result < 0) break;
+                            last_render = now;
+                            rendered = true; state_ = State::running;
+                        }
+                    } else if (rendered && wake == Wake::render) {
+                        last_render = now;
+                        stage = "render"; result = session->render();
+                    }
+                    if (result < 0) break;
+                    publish(session->metrics());
                 }
-                publish(session->metrics());
             }
+        } catch (...) { result = static_cast<std::int32_t>(0x80004005U); }
+        if (session) {
+            if (result >= 0) publish(session->metrics());
+            session->stop(); session.reset();
         }
-    } catch (...) { result = static_cast<std::int32_t>(0x80004005U); }
-    if (session) { session->stop(); publish(session->metrics()); session.reset(); }
+        if (token.stop_requested() || (!session_invalidated(result) && !timed_out)) break;
+        // Release every old client/service before rebuilding the same route. No
+        // processing state or endpoint buffers survive an invalidated session.
+        state_ = State::starting;
+        { std::lock_guard lock(setup_mutex_); setup_ = {}; }
+        publish({}); error_ = 0; stage = "reinitialize"; stage_ = stage;
+        try {
+            std::mutex mutex;
+            std::condition_variable_any retry;
+            std::unique_lock lock(mutex);
+            retry.wait_for(lock, token, std::chrono::milliseconds(100), [] { return false; });
+        } catch (...) { result = static_cast<std::int32_t>(0x80004005U); break; }
+    }
+    if (token.stop_requested()) result = 0;
     error_ = result; stage_ = result < 0 ? stage : "stopped";
     state_ = result < 0 ? State::failed : State::stopped;
 }

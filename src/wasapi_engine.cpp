@@ -15,6 +15,8 @@
 namespace audio {
 namespace {
 using Microsoft::WRL::ComPtr;
+static_assert(AUDCLNT_E_DEVICE_INVALIDATED == static_cast<std::int32_t>(0x88890004U));
+static_assert(AUDCLNT_E_RESOURCES_INVALIDATED == static_cast<std::int32_t>(0x88890026U));
 void check(HRESULT result) { if (FAILED(result)) throw WasapiError{result}; }
 struct TaskFree { void operator()(WAVEFORMATEX* p) const noexcept { CoTaskMemFree(p); } };
 using Mix = std::unique_ptr<WAVEFORMATEX, TaskFree>;
@@ -98,12 +100,16 @@ struct Stream {
         info.initialized = true;
         // GetDevicePeriod is a default, not evidence of the currently running period.
         if (mode == ShareMode::exclusive) info.actual_period_frames = info.buffer_frames;
-        else if (!client3) (void)client.As(&client3);
+        else if (!client3) {
+            const auto result = client.As(&client3);
+            if (session_invalidated(result)) check(result);
+        }
         if (mode == ShareMode::shared && client3) {
             WAVEFORMATEX* current = nullptr;
             UINT32 frames = 0;
             const auto result = client3->GetCurrentSharedModeEnginePeriod(&current, &frames);
             Mix current_owner(current);
+            if (session_invalidated(result)) check(result);
             if (SUCCEEDED(result) && current && current->nSamplesPerSec == mix->nSamplesPerSec)
                 info.actual_period_frames = frames;
         }
