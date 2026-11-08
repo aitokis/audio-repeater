@@ -88,8 +88,10 @@ public:
     Transport(unsigned input_rate, unsigned output_rate, unsigned channels,
               std::size_t capacity_frames, std::size_t target_frames,
               std::size_t max_output_frames);
+    // False for invalid extents or a backlog correction that discarded audio.
     bool push(std::span<const float>) noexcept;
     std::size_t render(std::span<float>) noexcept;
+    // Diagnostic only; queued audio and all processing state are retained.
     void discontinuity() noexcept;
     double queued_input() const noexcept;
     double internal_input() const noexcept { return src_.pending_input(); }

@@ -176,7 +176,8 @@ defers processing until the next event, without consuming transport samples or
 releasing an unacquired buffer. Each direction permits three consecutive errors;
 the fourth stops with that HRESULT. Successful acquisition clears that direction's
 streak. Initial render prefill and shared-mode failures stop immediately.
-Capture discontinuities reset the transport; timestamp errors have separate counters.
+Capture discontinuities increment a diagnostic counter and retain transport state;
+timestamp errors have separate counters.
 The initial target is at least 12 ms of input (576 frames at 48 kHz). It also covers
 the larger endpoint period (twice that for `stable`) and one maximum render request
 plus SRC lookahead, retaining whichever requirement is largest. The fixed capacity
@@ -236,11 +237,18 @@ log, perform I/O, or access devices.
   samples become zero. Integer encoding rounds to nearest (ties away from zero)
   and saturates. Float values retain finite headroom; nonfinite SRC output becomes
   zero. Integer conversion has no dither. Conversion spans must not overlap.
-- The fixed FIFO returns actual partial frame counts. `Transport` treats exceeding
-  its combined FIFO/SRC capacity as an overflow, counts dropped frames, resets the
-  SRC/controller, and starts prefill again. Discontinuity performs the same reset
-  and has its own counter. Steady underflow keeps the generated output prefix and
-  zero pads only its missing tail, preserving queued audio, SRC history, priming
+- The fixed FIFO returns actual partial frame counts. When combined FIFO/SRC
+  backlog plus an incoming packet reaches twice the target, `Transport` discards
+  oldest FIFO frames and, if needed, the oldest incoming frames in one correction
+  down to the target (rounded down for fractional SRC backlog). At 48 kHz with a
+  576-frame target, 1152 queued frames become 576. Newest audio, SRC history,
+  drift state and running state survive; normal rendering resumes immediately.
+  Each correction increments resyncs and counts discarded input frames. Exceeding
+  physical capacity also increments overflows and uses the same correction,
+  including packets larger than capacity. `push` returns false for invalid
+  extents or any correction that discards queued or incoming audio.
+  Discontinuity only increments its counter. Steady underflow keeps the generated
+  output prefix and zero pads only its missing tail, preserving queued audio, SRC history, priming
   and drift-controller state. SRC errors still reset the transport.
   Startup silence is counted separately. Invalid processing extents return failure.
 - SRC uses persistent `src_process`, actual input/output counts and live
@@ -252,9 +260,9 @@ log, perform I/O, or access devices.
   Updates occur at most 10 Hz, with a 1-second exponential error filter, PI feedback,
   conditional antiwindup, a 200 ppm/second slew limit, and ±2000 ppm input-clock
   correction bounds. Ratio is `nominal_ratio / (1 + correction_ppm / 1e6)`.
-  The controller remains active when nominal input/output rates match. Discontinuity,
-  overflow or SRC-error recovery clears controller history; ordinary underflow does
-  not. Clocks outside the correction range can cause counted silence or overflow.
+  The controller remains active when nominal input/output rates match. Only
+  SRC-error recovery clears transport/controller history and restarts prefill.
+  Clocks outside the correction range can cause counted silence or backlog corrections.
 
 `Transport` requires a target larger than one maximum output request converted to
 input frames plus SRC lookahead, and capacity at least four times the target.
@@ -283,10 +291,15 @@ and no sustained queue growth. Two more five-minute runs use equal nominal 48 kH
 rates, 144-frame requests, a 576-frame target and ±500 ppm, checking correction sign
 and convergence. Repeated partial/full underruns check zero tails, retained audio
 against a persistent SRC, sub-target resumption and continuing controller updates.
-Out-of-range slow capture pads shortages; overflow and discontinuities still reset.
+Out-of-range slow capture pads shortages; fast capture triggers backlog corrections.
+Repeated discontinuity flags preserve actual output, queue, SRC and live drift.
+Backlog tests cover initial and running streams, the twice-target threshold,
+sub-threshold jitter, fractional SRC backlog, retained newest stereo frames,
+oversized packets and immediate output without recurring corrections.
 C and C++ allocation hooks cover core and vendor processing,
-ratio changes and resets after warm-up. Actual compiled reverse-feedback and
-capacity-guard mutations must fail tests that also pass on the unmodified core.
+ratio changes, backlog corrections and resets after warm-up. Actual compiled
+reverse-feedback and capacity-guard mutations must fail tests that also pass on
+the unmodified core.
 
 ## Dependency and license
 
