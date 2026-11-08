@@ -213,20 +213,27 @@ void Transport::recover() noexcept {
     ++stats_.resyncs;
     fifo_.clear(); src_.reset(); drift_.reset(); started_ = false;
 }
-void Transport::discontinuity() noexcept { ++stats_.discontinuities; recover(); }
+void Transport::discontinuity() noexcept { ++stats_.discontinuities; }
 bool Transport::push(std::span<const float> input) noexcept {
     if (input.size() % channels_) return false;
     const auto frames = input.size() / channels_;
     stats_.input_frames += frames;
-    bool complete = true;
-    if (queued_input() + static_cast<double>(frames) > static_cast<double>(capacity())) {
-        ++stats_.overflows;
-        recover();
-        complete = false;
+    const bool overflow = queued_input() + static_cast<double>(frames) > static_cast<double>(capacity());
+    if (overflow) ++stats_.overflows;
+    if (overflow || queued_input() + static_cast<double>(frames) >= 2.0 * target_) {
+        // SRC history is retained. Fit the newest FIFO/input frames into the
+        // remaining target budget, rounding down for fractional SRC backlog.
+        const auto budget = static_cast<std::size_t>(std::max(0.0,
+            std::floor(static_cast<double>(target_) - std::max(0.0, src_.pending_input()))));
+        const auto keep_input = std::min(frames, budget);
+        const auto keep_fifo = std::min(fifo_.size(), budget - keep_input);
+        stats_.dropped_frames += fifo_.size() - keep_fifo + frames - keep_input;
+        ++stats_.resyncs;
+        fifo_.discard(fifo_.size() - keep_fifo);
+        fifo_.push(input.subspan((frames - keep_input) * channels_));
+        return false;
     }
-    const auto kept = fifo_.push(input);
-    stats_.dropped_frames += frames - kept;
-    return complete && kept == frames;
+    return fifo_.push(input) == frames;
 }
 std::size_t Transport::render(std::span<float> output) noexcept {
     if (output.size() % channels_ || output.size() / channels_ > max_output_) return 0;

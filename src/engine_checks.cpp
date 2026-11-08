@@ -130,7 +130,7 @@ void exclusive_setup() {
 void buffer_passes() {
     for (const bool capture : {true, false}) {
         Transport transport(48000,48000,1,8192,1024,480);
-        std::vector<float> initial(4096,0.25F), samples(480,0.25F);
+        std::vector<float> initial(1024,0.25F), samples(480,0.25F);
         require(transport.push(initial));
         BufferPass pass;
         int acquired = 0, processed = 0, released = 0;
